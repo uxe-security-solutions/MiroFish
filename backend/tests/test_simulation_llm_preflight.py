@@ -267,3 +267,52 @@ def test_an_equal_budget_does_speak_for_the_run():
     )
     assert "Every agent request will hit the same wall" in detail
     assert "STRICTER" not in detail
+
+
+# --- a tool call the server failed to parse ----------------------------------
+
+def test_unparsed_tool_call_markup_is_named_as_a_parser_mismatch():
+    """vLLM logs a parser traceback and still returns 200 with the raw text.
+
+    From the client that is indistinguishable from a model ignoring its tools,
+    which sends the operator after the wrong knob. The markup in `content` is
+    the one signal that says the model did its part.
+    """
+    ok, detail = llm_preflight.classify_answer(
+        _answer(content=(
+            "<think>I should post about this.</think>\n"
+            "<tool_call>\n<function=create_post>\n"
+            "<parameter=content>the buses are late</parameter>\n"
+            "</function>\n</tool_call>"
+        )),
+        elapsed=8.1,
+        timeout=300.0,
+    )
+    assert not ok
+    assert "did not parse" in detail
+    assert "qwen3_xml" in detail
+    assert "tool_parser" in detail
+
+
+def test_a_parser_mismatch_outranks_reasoning_as_the_explanation():
+    """The answer above also contains a <think> block.
+
+    Blaming reasoning there would send the operator to turn thinking off, which
+    would not fix a parser that cannot read the tool call either way.
+    """
+    _, detail = llm_preflight.classify_answer(
+        _answer(content="<think>hm</think><tool_call>\n<function=do_nothing>"),
+        elapsed=8.1,
+        timeout=300.0,
+    )
+    assert "enable_thinking" not in detail
+
+
+def test_plain_prose_is_still_attributed_to_reasoning_not_to_the_parser():
+    _, detail = llm_preflight.classify_answer(
+        _answer(content="<think>hm</think> I would like the second post."),
+        elapsed=8.1,
+        timeout=300.0,
+    )
+    assert "enable_thinking" in detail
+    assert "did not parse" not in detail
