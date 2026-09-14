@@ -222,6 +222,42 @@ reads tens of GB) and for failing fast while testing: `EMBED_WAIT_TRIES`,
 `LLM_WAIT_TRIES`, `SHIM_WAIT_TRIES`, `BACKEND_WAIT_TRIES`, `FRONTEND_WAIT_TRIES` - each
 counts 2-second polls.
 
+### When a simulation runs but records no actions
+
+A run that reports rounds against an empty action log is not a simulation of a quiet
+crowd - it is a model backend that answered none of the agents. The round loop absorbs
+per-agent failures on purpose, so nothing in the round count distinguishes the two.
+
+Ask the endpoint directly. This sends **one agent-shaped request** - an agent-sized
+prompt, the same tool schemas, the same timeout and output cap the agents get - and
+says which limit it hits:
+
+```bash
+backend/.venv/bin/python backend/scripts/run_parallel_simulation.py --preflight-only
+```
+
+`./scripts/provision_local.sh doctor` runs the same check. The three answers that
+matter, and what each one means:
+
+| What it reports | What is wrong | Fix |
+|---|---|---|
+| `APITimeoutError ... did not finish an agent-sized one within Ns` | The endpoint is up but cannot finish a real request in time - it is overloaded, still loading a model, or wedged | Check `docker logs sosim-llm`; lower `SIM_LLM_SEMAPHORE`, or raise `SIM_MODEL_TIMEOUT` |
+| `finish_reason=length ... spent the cap on a reasoning block` | A hybrid model is in reasoning mode, so it never reaches the tool call | Set `SIM_MODEL_EXTRA_BODY={"chat_template_kwargs":{"enable_thinking":false}}`, or serve vLLM with a matching `--reasoning-parser` |
+| `answered in prose but called no tool` | Tool calling is off or the parser does not match what this model emits | Check `--enable-auto-tool-choice` and `--tool-call-parser` (`hermes` vs `qwen3_xml` for Qwen3 builds) |
+
+The knob behind the second row is the one worth knowing about in advance.
+**camel-ai sends no `max_tokens` of its own**, and vLLM then lets a generation run to
+`--max-model-len` minus the prompt - around 30k tokens on the shipped settings. A model
+that opens with a `<think>` block will spend that budget, and at the per-stream decode
+rate of a fully batched local server it cannot finish inside any sane timeout: every
+agent request times out and the run records nothing. `SIM_MODEL_MAX_TOKENS` (default
+1024) bounds it, which turns that silent multi-hour timeout into an immediate
+`finish_reason="length"` the preflight can explain.
+
+A run that gets past the preflight and still stalls aborts itself: one round that
+activates agents, records nothing, and takes longer than `SIM_MODEL_TIMEOUT` is enough
+to stop, because agents that choose to do nothing answer quickly.
+
 ### Ports to open on the network
 
 **Expose exactly one port.**
