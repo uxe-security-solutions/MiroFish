@@ -149,13 +149,19 @@ def build_preflight_messages() -> List[Dict[str, str]]:
     ]
 
 
-def describe_timeout(exc: Exception, elapsed: float, timeout: float) -> str:
+def describe_timeout(
+    exc: Exception,
+    elapsed: float,
+    timeout: float,
+    model_timeout: Optional[float] = None,
+) -> str:
     """Describe a request that never came back.
 
     Args:
         exc: The exception raised by the client.
         elapsed: Seconds spent before it was raised.
-        timeout: The timeout in force.
+        timeout: The timeout in force for this check.
+        model_timeout: What the agents themselves are allowed, when it differs.
 
     Returns:
         str: the failure description.
@@ -163,12 +169,28 @@ def describe_timeout(exc: Exception, elapsed: float, timeout: float) -> str:
     # Name the exception type: a timeout, a refused connection and a rejected
     # key each call for a different fix.
     detail = f"{type(exc).__name__} after {elapsed:.1f}s: {exc}"
-    if "Timeout" in type(exc).__name__:
+    if "Timeout" not in type(exc).__name__:
+        return detail
+
+    detail += (
+        f" - the endpoint accepted the request but did not finish an "
+        f"agent-sized one within {timeout:.0f}s."
+    )
+    # An .env carrying SIM_PREFLIGHT_TIMEOUT from when this check was a
+    # one-token ping holds the new check to a budget the agents never run
+    # against. Saying "every agent request will hit the same wall" would then
+    # be a claim this check did not test.
+    if model_timeout is not None and model_timeout > timeout:
         detail += (
-            f" - the endpoint accepted the request but did not finish an "
-            f"agent-sized one within {timeout:.0f}s. Every agent request will "
-            f"hit the same wall."
+            f" This check was held to {timeout:.0f}s by SIM_PREFLIGHT_TIMEOUT "
+            f"while the agents themselves get {model_timeout:.0f}s "
+            f"(SIM_MODEL_TIMEOUT), so it is STRICTER than the run. Unset "
+            f"SIM_PREFLIGHT_TIMEOUT and re-check to test the real budget - "
+            f"the answer that comes back at {model_timeout:.0f}s names the "
+            f"actual limit."
         )
+    else:
+        detail += " Every agent request will hit the same wall."
     return detail
 
 
@@ -291,10 +313,17 @@ async def check_endpoint(
     max_tokens = get_model_max_tokens()
     extra_body = get_model_extra_body()
 
+    model_timeout, _ = get_model_request_budget()
+    budget_note = ""
+    if model_timeout > timeout:
+        budget_note = (
+            f" (STRICTER than the run's {model_timeout:.0f}s - "
+            f"SIM_PREFLIGHT_TIMEOUT is set)"
+        )
     log(
         f"{label} preflight: model={model}, "
         f"base_url={base_url[:40] if base_url else 'default'}..., "
-        f"timeout={timeout:.0f}s, "
+        f"timeout={timeout:.0f}s{budget_note}, "
         f"max_tokens={max_tokens if max_tokens is not None else 'unbounded'}"
     )
 
@@ -322,7 +351,7 @@ async def check_endpoint(
         response = await client.chat.completions.create(**request)
     except Exception as exc:
         elapsed = (datetime.now() - started).total_seconds()
-        return False, describe_timeout(exc, elapsed, timeout)
+        return False, describe_timeout(exc, elapsed, timeout, model_timeout)
     finally:
         try:
             await client.close()

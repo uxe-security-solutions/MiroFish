@@ -230,3 +230,40 @@ def test_a_refused_connection_is_named_as_itself_not_as_a_timeout():
     )
     assert "APIConnectionError" in detail
     assert "agent-sized" not in detail
+
+
+# --- a check held to a stricter bar than the run it is vouching for ----------
+
+def test_a_stricter_preflight_budget_does_not_claim_a_verdict_on_the_run():
+    """SIM_PREFLIGHT_TIMEOUT shipped at 60, sized for a one-token ping.
+
+    An .env of that vintage holds the agent-shaped check to a fifth of what the
+    agents get, so "every agent request will hit the same wall" would be a claim
+    this check did not test.
+    """
+    class APITimeoutError(Exception):
+        pass
+
+    detail = llm_preflight.describe_timeout(
+        APITimeoutError("Request timed out."),
+        elapsed=60.3,
+        timeout=60.0,
+        model_timeout=300.0,
+    )
+    assert "STRICTER than the run" in detail
+    assert "Unset SIM_PREFLIGHT_TIMEOUT" in detail
+    assert "Every agent request will hit the same wall" not in detail
+
+
+def test_an_equal_budget_does_speak_for_the_run():
+    class APITimeoutError(Exception):
+        pass
+
+    detail = llm_preflight.describe_timeout(
+        APITimeoutError("Request timed out."),
+        elapsed=300.4,
+        timeout=300.0,
+        model_timeout=300.0,
+    )
+    assert "Every agent request will hit the same wall" in detail
+    assert "STRICTER" not in detail
