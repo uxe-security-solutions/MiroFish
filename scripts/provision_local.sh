@@ -439,6 +439,26 @@ make_env() {
     "$(env_file_value SEMAPHORE_LIMIT)" \
     "$llm_budget" || true
 
+  # SIM_PREFLIGHT_TIMEOUT used to ship at 60, sized for a check that asked the
+  # endpoint for one token of small talk. That check now sends an agent-shaped
+  # request, so a .env of that vintage holds it to a fifth of what the agents
+  # themselves get and fails endpoints the run would have tolerated. The key is
+  # never rewritten (it may have been tuned), but an operator reading a preflight
+  # failure has to know the bar it was held to.
+  local preflight_timeout model_timeout
+  preflight_timeout="$(env_file_value SIM_PREFLIGHT_TIMEOUT)"
+  model_timeout="$(env_file_value SIM_MODEL_TIMEOUT)"
+  model_timeout="${model_timeout:-300}"
+  if [[ -n "$preflight_timeout" ]] \
+     && [[ "$preflight_timeout" =~ ^[0-9]+$ ]] \
+     && [[ "${model_timeout%.*}" =~ ^[0-9]+$ ]] \
+     && (( preflight_timeout < ${model_timeout%.*} )); then
+    warn "SIM_PREFLIGHT_TIMEOUT=$preflight_timeout is BELOW SIM_MODEL_TIMEOUT=$model_timeout."
+    warn "  The preflight now sends an agent-shaped request, so this holds it to a"
+    warn "  stricter bar than the agents run against and can fail an endpoint the"
+    warn "  run would tolerate. Delete the key to track SIM_MODEL_TIMEOUT."
+  fi
+
   # Pin the shim's sqlite state to an ABSOLUTE path under this repo's own
   # gitignored data/. This is non-relocating BY CONSTRUCTION: ensure_env_key
   # writes only when the key is ABSENT, and an absent key already resolved to
