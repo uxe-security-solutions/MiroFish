@@ -89,9 +89,28 @@ MAX_MODEL_LEN="${MAX_MODEL_LEN:-32768}"
 # bandwidth-bound (~273 GB/s) and divides across sequences, so admitting 32
 # does not serve 32 at single-stream speed. Sweep before trusting a number.
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-16}"
-# Qwen3 family. NVIDIA's playbook uses qwen3_xml for some Qwen3.6 builds;
-# if tool calls come back malformed, try that instead.
-TOOL_CALL_PARSER="${TOOL_CALL_PARSER:-hermes}"
+# Qwen3 family. This MUST match the tool-call dialect the model actually emits,
+# and hermes — the old default here — does not match the shipped
+# RedHatAI/Qwen3.6-35B-A3B-NVFP4. That build emits the XML form
+# (<function=name><parameter=x>...), hermes expects JSON inside <tool_call>, and
+# every single agent request therefore died in the server with:
+#
+#   ERROR hermes_tool_parser.py:139 Error in extracting tool call from response
+#   json.decoder.JSONDecodeError: Expecting value: line 2 column 1 (char 1)
+#
+# That failure is close to invisible from the client: vLLM logs the traceback,
+# then returns 200 with the unparsed markup dumped into message.content. OASIS
+# sees an answer carrying no tool call, records no action, and the run reports
+# full rounds against an empty action log — which is exactly how it presented,
+# as a simulation that "ran" for 7.7 hours and produced nothing.
+#
+# Measured on a DGX Spark (2026-09-14): with qwen3_xml the preflight returns
+# finish_reason=tool_calls in 8.1s; with hermes the identical request comes back
+# as prose. Change this only for a model whose dialect you have checked, and
+# check it with:
+#
+#   backend/.venv/bin/python backend/scripts/run_parallel_simulation.py --preflight-only
+TOOL_CALL_PARSER="${TOOL_CALL_PARSER:-qwen3_xml}"
 
 # How containers are given the GPU. `--gpus all` suits the legacy nvidia
 # runtime; hosts wired up through CDI may need `--device nvidia.com/gpu=all`
@@ -742,9 +761,37 @@ start_falkordb() {
   assert_container_alive falkordb 3
 }
 
+# Report when the LIVE container was started with different serving flags than
+# this script would use now. Recreating it is not this script's call — it would
+# drop a model that took minutes to load, possibly mid-run — but silently
+# serving the old flags is how a fixed default fails to reach the one host that
+# needed it. The tool-call parser is checked by name because getting it wrong
+# does not fail loudly: vLLM logs a parser traceback and still answers 200, so
+# every agent request comes back without the tool call it asked for.
+warn_if_llm_flags_stale() {
+  local live
+  live=$(docker inspect --format '{{join .Args " "}}' sosim-llm 2>/dev/null) || return 0
+  [[ -n "$live" ]] || return 0
+
+  local live_parser=""
+  if [[ "$live" =~ --tool-call-parser[[:space:]]+([^[:space:]]+) ]]; then
+    live_parser="${BASH_REMATCH[1]}"
+  fi
+  if [[ -n "$live_parser" && "$live_parser" != "$TOOL_CALL_PARSER" ]]; then
+    warn "the RUNNING container serves --tool-call-parser $live_parser, not $TOOL_CALL_PARSER."
+    warn "  A parser that does not match the model still returns 200, with the tool call"
+    warn "  left unparsed in the message content — so agents record no actions. To apply"
+    warn "  the current setting:  docker rm -f sosim-llm && $0 start"
+  fi
+}
+
 start_llm() {
   step "LLM server (vLLM)"
-  if container_up sosim-llm; then ok "already running"; return; fi
+  if container_up sosim-llm; then
+    ok "already running"
+    warn_if_llm_flags_stale
+    return
+  fi
   docker rm -f sosim-llm >/dev/null 2>&1 || true
 
   # Unified memory means the OS page cache eats into the KV cache budget.
