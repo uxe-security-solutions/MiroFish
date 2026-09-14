@@ -242,7 +242,7 @@ matter, and what each one means:
 | What it reports | What is wrong | Fix |
 |---|---|---|
 | `APITimeoutError ... did not finish an agent-sized one within Ns` | The endpoint is up but cannot finish a real request in time - it is overloaded, still loading a model, or wedged | Check `docker logs sosim-llm`; lower `SIM_LLM_SEMAPHORE`, or raise `SIM_MODEL_TIMEOUT` |
-| `finish_reason=length ... spent the cap on a reasoning block` | A hybrid model is in reasoning mode, so it never reaches the tool call | Set `SIM_MODEL_EXTRA_BODY={"chat_template_kwargs":{"enable_thinking":false}}`, or serve vLLM with a matching `--reasoning-parser` |
+| `finish_reason=length ... spent the cap on a reasoning block` | A hybrid model is in reasoning mode, so it never reaches the tool call | Set `SIM_MODEL_EXTRA_BODY='{"chat_template_kwargs":{"enable_thinking":false}}'` in `.env` — **single-quoted**, or `source` strips the inner quotes — or serve vLLM with a matching `--reasoning-parser` |
 | `the model DID emit a tool call but the server did not parse it` | `--tool-call-parser` does not match what this model emits. vLLM logs a parser traceback and still returns 200 with the raw markup as content, so from the client it looks like a disobedient model | `TOOL_CALL_PARSER=qwen3_xml` for Qwen3 builds; confirm with `docker logs sosim-llm \| grep -i tool_parser` |
 | `answered in prose but called no tool` | Tool calling is off entirely | Check `--enable-auto-tool-choice` |
 
