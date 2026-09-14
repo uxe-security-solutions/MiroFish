@@ -398,6 +398,12 @@ make_env() {
     "a queued request's wait counts against this"
   ensure_env_key SIM_MODEL_MAX_RETRIES 1 \
     "a retry re-enters the same queue, so retries multiply load"
+  # The cap that decides whether a reasoning model can answer at all. Without
+  # it camel-ai sends no max_tokens, vLLM lets the generation run to
+  # --max-model-len minus the prompt, and a model that opens with a <think>
+  # block spends the whole timeout before it ever reaches a tool call.
+  ensure_env_key SIM_MODEL_MAX_TOKENS 1024 \
+    "uncapped, one <think> block runs to --max-model-len and times the request out"
 
   # Same coupling for graph ingest, where the two knobs MULTIPLY: the shim runs
   # ZEP_COMPAT_BATCH_CONCURRENCY episodes at once and Graphiti fans each one out
@@ -1113,6 +1119,32 @@ do_doctor() {
   else
     warn "server returns $dim dims but EMBEDDING_DIM=${EMBEDDING_DIM:-1024}."
     warn "Fix this BEFORE ingesting anything — Graphiti truncates silently."
+  fi
+
+  step "Simulation LLM request"
+  # The embedding probe above proves that server answers; this proves the CHAT
+  # server can do the thing a simulation actually needs, which is to return a
+  # TOOL CALL over an agent-sized prompt inside the run's own timeout. Those
+  # are different questions: an endpoint that answers "ping" instantly can
+  # still fail every agent request, and when it does the round loop absorbs the
+  # failures and the run reports full rounds against an empty action log. Ask
+  # the real question here, where it costs one request.
+  local sim_py="$ROOT/backend/.venv/bin/python"
+  if [[ ! -x "$sim_py" ]]; then
+    note "backend venv missing at $sim_py — run: $0 setup"
+  else
+    load_env
+    local llm_budget_s="${SIM_MODEL_TIMEOUT:-300}"
+    # Give the wrapper a little more than the request itself is allowed, so a
+    # bounded-out probe means the request hung, not that we cut it short.
+    local probe_budget_s=$(( ${llm_budget_s%.*} + 30 ))
+    if run_bounded "$probe_budget_s" "$sim_py" \
+         "$ROOT/backend/scripts/run_parallel_simulation.py" \
+         --preflight-only --twitter-only; then
+      ok "the endpoint returns a tool call over an agent-sized prompt"
+    else
+      fail "the chat endpoint cannot serve a simulation (see the line above)"
+    fi
   fi
 
   step "Config sanity"

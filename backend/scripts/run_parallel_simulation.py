@@ -110,7 +110,9 @@ else:
 class MaxTokensWarningFilter(logging.Filter):
     """Drop the camel-ai max_tokens warning.
 
-    Leaving max_tokens unset is deliberate, so the model decides for itself.
+    max_tokens is set explicitly from SIM_MODEL_MAX_TOKENS (see llm_budget),
+    so the warning only fires when an operator has deliberately unbounded the
+    generation, and it says nothing they did not already ask for.
     """
     
     def filter(self, record):
@@ -163,6 +165,12 @@ def init_logging_for_simulation(simulation_dir: str):
 
 
 from action_logger import SimulationLogManager, PlatformActionLogger
+from llm_budget import (
+    describe_budget,
+    get_model_config_dict,
+    get_model_request_budget,
+)
+from llm_preflight import check_endpoint
 
 try:
     from camel.models import ModelFactory
@@ -981,33 +989,6 @@ def _get_comment_info(
     return None
 
 
-# The per-request budget handed to the LLM client. camel-ai would otherwise
-# default to a 180s timeout with 3 retries, i.e. 4 attempts and a 720s ceiling
-# per agent request. An unresponsive endpoint therefore burns that budget on
-# every round, which is how a dead endpoint once cost a full 11-hour run
-# without failing the run. Both values are configurable so a slow endpoint can
-# be given more room and a fragile one can be made to fail fast.
-DEFAULT_MODEL_TIMEOUT = 180.0
-DEFAULT_MODEL_MAX_RETRIES = 3
-
-
-def get_model_request_budget() -> Tuple[float, int]:
-    """Read the per-request timeout and retry count from the environment.
-
-    Returns:
-        Tuple[float, int]: the timeout in seconds and the retry count.
-    """
-    try:
-        timeout = float(os.environ.get("SIM_MODEL_TIMEOUT", DEFAULT_MODEL_TIMEOUT))
-    except ValueError:
-        timeout = DEFAULT_MODEL_TIMEOUT
-    try:
-        max_retries = int(os.environ.get("SIM_MODEL_MAX_RETRIES", DEFAULT_MODEL_MAX_RETRIES))
-    except ValueError:
-        max_retries = DEFAULT_MODEL_MAX_RETRIES
-    return max(1.0, timeout), max(0, max_retries)
-
-
 def resolve_llm_settings(config: Dict[str, Any], use_boost: bool = False) -> Dict[str, str]:
     """Resolve the LLM settings one platform will run against.
 
@@ -1085,14 +1066,18 @@ def create_model(config: Dict[str, Any], use_boost: bool = False):
     print(
         f"{settings['label']} model={settings['model']}, "
         f"base_url={base_url[:40] if base_url else 'default'}..., "
-        f"timeout={timeout:.0f}s, max_retries={max_retries}"
+        f"{describe_budget()}"
     )
     
     # Pass the budget explicitly rather than inheriting the library default,
     # so the value is visible in the log and tunable from the environment.
+    # model_config_dict carries the output cap: camel-ai's own default sends
+    # no max_tokens, which lets one agent's answer run to the server's context
+    # limit and blow the timeout for every request sharing the batch.
     return ModelFactory.create(
         model_platform=ModelPlatformType.OPENAI,
         model_type=settings["model"],
+        model_config_dict=get_model_config_dict(),
         timeout=timeout,
         max_retries=max_retries,
     )
@@ -1120,24 +1105,12 @@ def get_llm_semaphore() -> int:
     return max(1, value)
 
 
-DEFAULT_PREFLIGHT_TIMEOUT = 60.0
-
-
 async def preflight_check_llm(
     config: Dict[str, Any],
     use_boost: bool,
     log,
 ) -> Tuple[bool, str]:
-    """Send one tiny completion to prove the endpoint actually answers.
-
-    A simulation makes no progress at all when the configured model does not
-    respond, but the round loop tolerates per-agent failures and so keeps
-    going, reporting a full round count against zero real actions. Checking
-    once up front turns that silent multi-hour failure into an immediate one.
-
-    The check deliberately uses no retries and a short timeout: the question
-    is whether the endpoint responds at all, not whether it responds quickly
-    under load.
+    """Prove the endpoint one configuration names can serve the run.
 
     Args:
         config: The simulation config.
@@ -1145,62 +1118,21 @@ async def preflight_check_llm(
         log: A callable taking one message string.
 
     Returns:
-        Tuple[bool, str]: whether the endpoint answered, plus a description.
+        Tuple[bool, str]: whether the endpoint answered usably, plus a
+        description.
     """
     try:
         settings = resolve_llm_settings(config, use_boost)
     except ValueError as exc:
         return False, str(exc)
-    
-    try:
-        timeout = float(os.environ.get("SIM_PREFLIGHT_TIMEOUT", DEFAULT_PREFLIGHT_TIMEOUT))
-    except ValueError:
-        timeout = DEFAULT_PREFLIGHT_TIMEOUT
-    
-    base_url = settings["base_url"]
-    log(
-        f"{settings['label']} preflight: model={settings['model']}, "
-        f"base_url={base_url[:40] if base_url else 'default'}..., "
-        f"timeout={timeout:.0f}s"
-    )
-    
-    from openai import AsyncOpenAI
-    
-    client = AsyncOpenAI(
+
+    return await check_endpoint(
         api_key=settings["api_key"],
-        base_url=base_url or None,
-        timeout=timeout,
-        max_retries=0,
+        base_url=settings["base_url"],
+        model=settings["model"],
+        log=log,
+        label=settings["label"],
     )
-    
-    started = datetime.now()
-    try:
-        response = await client.chat.completions.create(
-            model=settings["model"],
-            messages=[{"role": "user", "content": "ping"}],
-            max_tokens=1,
-        )
-    except Exception as exc:
-        elapsed = (datetime.now() - started).total_seconds()
-        # Name the exception type: a timeout, a refused connection and a
-        # rejected key each call for a different fix.
-        return False, (
-            f"{type(exc).__name__} after {elapsed:.1f}s: {exc}"
-        )
-    finally:
-        try:
-            await client.close()
-        except Exception:
-            pass
-    
-    elapsed = (datetime.now() - started).total_seconds()
-    
-    # A 200 carrying no choices means the endpoint is reachable but is not
-    # serving completions, which fails agents just as surely as a timeout.
-    if not getattr(response, "choices", None):
-        return False, f"responded in {elapsed:.1f}s but returned no choices"
-    
-    return True, f"answered in {elapsed:.1f}s"
 
 
 async def preflight_check_all(
@@ -1257,11 +1189,11 @@ async def preflight_check_all(
     else:
         log("")
         log("Preflight FAILED - aborting before the simulation starts.")
-        log("A simulation cannot produce any agent behaviour while the model")
-        log("is unreachable; it would only burn the full round budget on")
-        log("timeouts and finish with an empty action log.")
-        log("Check that the endpoint is up, that LLM_BASE_URL and")
-        log("LLM_MODEL_NAME are correct, and that the key is accepted.")
+        log("The check sends one agent-shaped request: an agent-sized prompt,")
+        log("the same tool schemas, the same timeout and output cap. Failing")
+        log("it means every agent request will fail the same way, and the run")
+        log("would spend its whole round budget to finish with an empty")
+        log("action log. The line above says which limit was hit.")
         log("Pass --skip-preflight to run anyway.")
     log("=" * 60)
     
@@ -1486,6 +1418,7 @@ async def run_twitter_simulation(
     # burns the timeout budget on every remaining round.
     zero_action_streak = 0
     zero_action_limit = get_zero_action_limit()
+    model_timeout, _ = get_model_request_budget()
     
     for round_num in range(total_rounds):
         # Stop as soon as a shutdown was requested.
@@ -1513,7 +1446,9 @@ async def run_twitter_simulation(
             continue
         
         actions = {agent: LLMAction() for _, agent in active_agents}
+        round_started = datetime.now()
         await result.env.step(actions)
+        round_elapsed = (datetime.now() - round_started).total_seconds()
         
         # Read the actions that actually ran and log them.
         actual_actions, last_rowid = fetch_new_actions_from_db(
@@ -1544,9 +1479,32 @@ async def run_twitter_simulation(
             if zero_action_limit and zero_action_streak == 1:
                 log_info(
                     f"Round {round_num + 1} activated {len(active_agents)} "
-                    f"agents but recorded no action - watching for a run of "
-                    f"these (abort at {zero_action_limit})"
+                    f"agents but recorded no action in {round_elapsed:.0f}s - "
+                    f"watching for a run of these (abort at "
+                    f"{zero_action_limit})"
                 )
+            # One round is enough when it also outran a full request timeout.
+            # Agents that choose to do nothing answer quickly; a round that
+            # both records nothing and spends longer than the timeout did not
+            # get answers at all, and the remaining rounds will not either.
+            # Waiting out the streak costs hours to learn the same thing.
+            if zero_action_limit and round_elapsed >= model_timeout:
+                result.abort_reason = (
+                    f"round {round_num + 1} activated {len(active_agents)} "
+                    f"agents, recorded no action, and took {round_elapsed:.0f}s "
+                    f"- longer than the {model_timeout:.0f}s request timeout, "
+                    f"so the model backend answered none of them"
+                )
+                log_info("=" * 60)
+                log_info(f"ABORTING at round {round_num + 1}/{total_rounds}")
+                log_info(result.abort_reason)
+                log_info(
+                    "Run the preflight against this endpoint to see which "
+                    "limit it hits. Set SIM_ZERO_ACTION_ABORT=0 to disable "
+                    "this check."
+                )
+                log_info("=" * 60)
+                break
             if zero_action_limit and zero_action_streak >= zero_action_limit:
                 result.abort_reason = (
                     f"{zero_action_streak} consecutive rounds activated agents "
@@ -1727,6 +1685,7 @@ async def run_reddit_simulation(
     # burns the timeout budget on every remaining round.
     zero_action_streak = 0
     zero_action_limit = get_zero_action_limit()
+    model_timeout, _ = get_model_request_budget()
     
     for round_num in range(total_rounds):
         # Stop as soon as a shutdown was requested.
@@ -1754,7 +1713,9 @@ async def run_reddit_simulation(
             continue
         
         actions = {agent: LLMAction() for _, agent in active_agents}
+        round_started = datetime.now()
         await result.env.step(actions)
+        round_elapsed = (datetime.now() - round_started).total_seconds()
         
         # Read the actions that actually ran and log them.
         actual_actions, last_rowid = fetch_new_actions_from_db(
@@ -1785,9 +1746,32 @@ async def run_reddit_simulation(
             if zero_action_limit and zero_action_streak == 1:
                 log_info(
                     f"Round {round_num + 1} activated {len(active_agents)} "
-                    f"agents but recorded no action - watching for a run of "
-                    f"these (abort at {zero_action_limit})"
+                    f"agents but recorded no action in {round_elapsed:.0f}s - "
+                    f"watching for a run of these (abort at "
+                    f"{zero_action_limit})"
                 )
+            # One round is enough when it also outran a full request timeout.
+            # Agents that choose to do nothing answer quickly; a round that
+            # both records nothing and spends longer than the timeout did not
+            # get answers at all, and the remaining rounds will not either.
+            # Waiting out the streak costs hours to learn the same thing.
+            if zero_action_limit and round_elapsed >= model_timeout:
+                result.abort_reason = (
+                    f"round {round_num + 1} activated {len(active_agents)} "
+                    f"agents, recorded no action, and took {round_elapsed:.0f}s "
+                    f"- longer than the {model_timeout:.0f}s request timeout, "
+                    f"so the model backend answered none of them"
+                )
+                log_info("=" * 60)
+                log_info(f"ABORTING at round {round_num + 1}/{total_rounds}")
+                log_info(result.abort_reason)
+                log_info(
+                    "Run the preflight against this endpoint to see which "
+                    "limit it hits. Set SIM_ZERO_ACTION_ABORT=0 to disable "
+                    "this check."
+                )
+                log_info("=" * 60)
+                break
             if zero_action_limit and zero_action_streak >= zero_action_limit:
                 result.abort_reason = (
                     f"{zero_action_streak} consecutive rounds activated agents "
@@ -1826,8 +1810,9 @@ async def main():
     parser.add_argument(
         '--config', 
         type=str, 
-        required=True,
-        help='Path of the simulation config file (simulation_config.json)'
+        default=None,
+        help='Path of the simulation config file (simulation_config.json). '
+             'Required except with --preflight-only.'
     )
     parser.add_argument(
         '--twitter-only',
@@ -1857,6 +1842,14 @@ async def main():
         default=False,
         help='Skip the LLM preflight check and start the run regardless'
     )
+    parser.add_argument(
+        '--preflight-only',
+        action='store_true',
+        default=False,
+        help='Run the LLM preflight check and exit, without building any '
+             'environment. Use it to test an endpoint in one request instead '
+             'of inferring its health from a run that records no actions.'
+    )
     
     args = parser.parse_args()
     
@@ -1864,6 +1857,28 @@ async def main():
     # termination signal.
     global _shutdown_event
     _shutdown_event = asyncio.Event()
+    
+    # --preflight-only answers one question - can this endpoint serve a run -
+    # and needs no config to answer it, because every setting it depends on
+    # comes from the environment. Handle it before anything touches the
+    # filesystem.
+    if args.preflight_only:
+        preflight_config = (
+            load_config(args.config)
+            if args.config and os.path.exists(args.config)
+            else {}
+        )
+        ok = await preflight_check_all(
+            preflight_config,
+            run_twitter=not args.reddit_only,
+            run_reddit=not args.twitter_only,
+            log_manager=None,
+        )
+        sys.exit(0 if ok else 1)
+    
+    if not args.config:
+        print("Error: --config is required (except with --preflight-only)")
+        sys.exit(1)
     
     if not os.path.exists(args.config):
         print(f"Error: config file not found: {args.config}")

@@ -51,6 +51,12 @@ else:
 
 import re
 
+from llm_budget import (
+    describe_budget,
+    get_model_config_dict,
+    get_model_request_budget,
+)
+
 
 class UnicodeFormatter(logging.Formatter):
     """Turn Unicode escape sequences in a log record into readable characters."""
@@ -72,7 +78,9 @@ class UnicodeFormatter(logging.Formatter):
 class MaxTokensWarningFilter(logging.Filter):
     """Drop the camel-ai max_tokens warning.
 
-    Leaving max_tokens unset is deliberate, so the model decides for itself.
+    max_tokens is set explicitly from SIM_MODEL_MAX_TOKENS (see llm_budget),
+    so the warning only fires when an operator has deliberately unbounded the
+    generation, and it says nothing they did not already ask for.
     """
     
     def filter(self, record):
@@ -464,11 +472,23 @@ class RedditSimulationRunner:
         if llm_base_url:
             os.environ["OPENAI_API_BASE_URL"] = llm_base_url
         
-        print(f"LLM configuration: model={llm_model}, base_url={llm_base_url[:40] if llm_base_url else 'default'}...")
+        timeout, max_retries = get_model_request_budget()
+        print(
+            f"LLM configuration: model={llm_model}, "
+            f"base_url={llm_base_url[:40] if llm_base_url else 'default'}..., "
+            f"{describe_budget()}"
+        )
         
+        # Same budget the parallel runner uses. Left to the library defaults
+        # this inherited a 180s timeout with 3 retries and no output cap at
+        # all, which lets one agent's answer run to the server's context limit
+        # and time out every request sharing the batch with it.
         return ModelFactory.create(
             model_platform=ModelPlatformType.OPENAI,
             model_type=llm_model,
+            model_config_dict=get_model_config_dict(),
+            timeout=timeout,
+            max_retries=max_retries,
         )
     
     def _get_active_agents_for_round(
