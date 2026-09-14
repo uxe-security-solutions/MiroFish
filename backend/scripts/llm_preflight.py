@@ -244,6 +244,17 @@ def classify_answer(
     # A hybrid model left in reasoning mode is the usual reason an answer never
     # arrives: it spends the whole budget before reaching the tool call.
     thinking = "<think>" in content or "</think>" in content
+    # Tool-call markup left sitting in `content` means the model DID answer with
+    # a tool call and the SERVER failed to turn it into one. vLLM reports that
+    # as a parser traceback in its own log and still returns 200 with the raw
+    # text as content, so the API response alone makes a working model look like
+    # a disobedient one. This is what a --tool-call-parser mismatch looks like
+    # from the client: hermes expects JSON inside <tool_call>, and a Qwen3 build
+    # emitting the XML form raises JSONDecodeError on every single call.
+    attempted_tool_call = any(
+        marker in content
+        for marker in ("<tool_call>", "<function=", "<function ", "<invoke")
+    )
     reasoning_fix = (
         "turn reasoning off with SIM_MODEL_EXTRA_BODY="
         '{"chat_template_kwargs":{"enable_thinking":false}}, or serve vLLM '
@@ -261,6 +272,20 @@ def classify_answer(
         return False, f"{stats} - {hint}"
 
     if not tool_calls:
+        if attempted_tool_call:
+            # Lead with this: it outranks reasoning as an explanation, because
+            # the model already did the thing it is being blamed for not doing.
+            hint = (
+                "the model DID emit a tool call but the server did not parse "
+                "it - the raw markup came back as message content instead. "
+                "That is a --tool-call-parser mismatch, not a model that "
+                "ignored its tools. Confirm it in the server's own log "
+                "(`docker logs sosim-llm | grep -i tool_parser`), then serve "
+                "vLLM with a parser matching what this model emits - for a "
+                "Qwen3 build that is usually qwen3_xml rather than hermes."
+            )
+            return False, f"{stats} - {hint}"
+
         hint = (
             "answered in prose but called no tool, so OASIS would record no "
             "action for this agent. "
