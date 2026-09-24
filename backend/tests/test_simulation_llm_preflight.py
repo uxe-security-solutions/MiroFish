@@ -97,10 +97,17 @@ def test_extra_body_reaches_the_request(monkeypatch):
     assert config["extra_body"] == {"chat_template_kwargs": {"enable_thinking": False}}
 
 
-def test_malformed_extra_body_is_ignored_not_fatal(monkeypatch):
+def test_malformed_extra_body_is_fatal_not_ignored(monkeypatch):
+    """This reverses an earlier decision to swallow the error.
+
+    Ignoring it meant a typo here turned reasoning back on with nothing in any
+    log to say so, and a run that records no actions is expensive to diagnose.
+    Failing at startup costs seconds and names the cause.
+    """
     _clear(monkeypatch)
     monkeypatch.setenv("SIM_MODEL_EXTRA_BODY", "{not json")
-    assert llm_budget.get_model_extra_body() == {}
+    with pytest.raises(ValueError):
+        llm_budget.get_model_extra_body()
 
 
 # --- the preflight request ---------------------------------------------------
@@ -316,3 +323,39 @@ def test_plain_prose_is_still_attributed_to_reasoning_not_to_the_parser():
     )
     assert "enable_thinking" in detail
     assert "did not parse" not in detail
+
+
+# --- the .env quoting trap ---------------------------------------------------
+
+def test_a_mangled_extra_body_fails_loudly_instead_of_being_dropped(monkeypatch):
+    """provision_local.sh reads .env with `source`, and bash strips the inner
+    double quotes from an unquoted value. Silently returning {} there would
+    drop a setting the operator asked for and leave no trace of why it did
+    nothing - the exact failure mode this module exists to prevent.
+    """
+    _clear(monkeypatch)
+    monkeypatch.setenv(
+        "SIM_MODEL_EXTRA_BODY", "{chat_template_kwargs:{enable_thinking:false}}"
+    )
+    with pytest.raises(ValueError) as excinfo:
+        llm_budget.get_model_extra_body()
+    assert "SINGLE quotes" in str(excinfo.value)
+
+
+def test_a_non_object_extra_body_is_rejected(monkeypatch):
+    _clear(monkeypatch)
+    monkeypatch.setenv("SIM_MODEL_EXTRA_BODY", '["not", "an", "object"]')
+    with pytest.raises(ValueError) as excinfo:
+        llm_budget.get_model_extra_body()
+    assert "must be a JSON object" in str(excinfo.value)
+
+
+def test_the_advice_the_preflight_prints_is_the_form_that_survives_both_readers():
+    """Printing the unquoted form would hand the operator a fix that works in
+    python-dotenv and silently does nothing under provision_local.sh."""
+    _, detail = llm_preflight.classify_answer(
+        _answer(content="<think>hm</think> I would like the second post."),
+        elapsed=8.0,
+        timeout=300.0,
+    )
+    assert "SIM_MODEL_EXTRA_BODY='{\"chat_template_kwargs\"" in detail

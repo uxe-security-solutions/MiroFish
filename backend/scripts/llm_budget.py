@@ -95,9 +95,29 @@ def get_model_extra_body() -> Dict[str, Any]:
         return {}
     try:
         parsed = json.loads(raw)
-    except ValueError:
-        return {}
-    return parsed if isinstance(parsed, dict) else {}
+    except ValueError as exc:
+        # Loud, not silent. Returning {} here would drop a setting the operator
+        # explicitly asked for and leave no trace of why it did nothing - which
+        # is the exact failure mode this whole check exists to prevent.
+        #
+        # The overwhelmingly likely cause is quoting. provision_local.sh reads
+        # .env with `source`, and bash strips the inner double quotes from an
+        # unquoted value, turning valid JSON into {chat_template_kwargs:{...}}.
+        # python-dotenv tolerates the unquoted form, so this breaks in exactly
+        # one of the two paths that read the same file.
+        raise ValueError(
+            f"SIM_MODEL_EXTRA_BODY is not valid JSON ({exc}). Got: {raw!r}. "
+            f"It must be wrapped in SINGLE quotes in .env, or `source` strips "
+            f"the inner double quotes: "
+            f"SIM_MODEL_EXTRA_BODY=\'{{\"chat_template_kwargs\":"
+            f"{{\"enable_thinking\":false}}}}\'"
+        ) from exc
+    if not isinstance(parsed, dict):
+        raise ValueError(
+            f"SIM_MODEL_EXTRA_BODY must be a JSON object, not "
+            f"{type(parsed).__name__}. Got: {raw!r}"
+        )
+    return parsed
 
 
 def get_model_config_dict() -> Dict[str, Any]:

@@ -255,9 +255,14 @@ def classify_answer(
         marker in content
         for marker in ("<tool_call>", "<function=", "<function ", "<invoke")
     )
+    # Single-quoted on purpose: provision_local.sh reads .env with `source`,
+    # and bash strips the inner double quotes from an unquoted value. Printing
+    # the form that only works in one of the two readers would be handing the
+    # operator a fix that silently does nothing.
     reasoning_fix = (
-        "turn reasoning off with SIM_MODEL_EXTRA_BODY="
-        '{"chat_template_kwargs":{"enable_thinking":false}}, or serve vLLM '
+        "turn reasoning off by adding this to .env, SINGLE-QUOTED: "
+        'SIM_MODEL_EXTRA_BODY=\'{"chat_template_kwargs":'
+        '{"enable_thinking":false}}\' - or serve vLLM '
         "with a matching --reasoning-parser."
     )
 
