@@ -2,13 +2,20 @@
 #
 # provision_local.sh — bring up SoSim entirely on this machine.
 #
-# Target: NVIDIA DGX Spark (GB10, aarch64, 128GB unified memory), Ubuntu-based.
-# Works on any aarch64/x86_64 Linux box with Docker + an NVIDIA runtime.
+# Everything hardware-specific lives in a runtime profile, scripts/runtimes/<name>.sh:
+#
+#   dgx-spark  NVIDIA DGX Spark (GB10, aarch64, 128GB unified memory) — the default
+#   l40s       NVIDIA L40S 48GB (Ada, x86_64), including the L40S-48C vGPU
+#
+# Select one with a wrapper (scripts/provision_dgx_spark.sh, scripts/provision_l40s.sh),
+# with --runtime <name>, or with SOSIM_RUNTIME=<name>. `setup` records the choice
+# in .env, so later commands on the same host get the same runtime back; with
+# nothing recorded, the profile matching this host's GPU is used.
 #
 #   ./scripts/provision_local.sh setup     # deps, submodule, .env, models  (needs network)
 #   ./scripts/provision_local.sh start     # bring every service up        (offline)
 #   ./scripts/provision_local.sh all       # setup + start
-#   ./scripts/provision_local.sh status | logs [svc] | stop | doctor | test
+#   ./scripts/provision_local.sh status | logs [svc] | stop | doctor | test | runtimes
 #
 # Add -v (or VERBOSE=1) to echo every external command as it runs.
 #
@@ -37,18 +44,24 @@ RUN_DIR="$DATA_DIR/run"
 LOG_DIR="$DATA_DIR/logs"
 HF_CACHE="${HF_CACHE_DIR:-$DATA_DIR/hf-cache}"
 
-# --- tunables (override via environment) -------------------------------------
+# What the user typed to get here. The per-runtime wrappers exec this script and
+# set it, so every "run: ..." hint names the wrapper that selected the runtime,
+# not this file — which, run bare on a host with no recorded runtime, would
+# fall back to dgx-spark.
+SELF="${SOSIM_ENTRYPOINT:-$0}"
 
-# NGC's vLLM build is the tested path on GB10. Upstream vllm/vllm-openai has
-# been reported broken on this chip (its bundled torch compiles only through
-# sm_120; GB10 is sm_121) — `doctor` checks for that explicitly.
-VLLM_IMAGE="${VLLM_IMAGE:-nvcr.io/nvidia/vllm:26.05.post1-py3}"
-# Embeddings run on the SAME vLLM image. HuggingFace TEI was the obvious
-# choice but publishes no arm64 image at all — every cpu-* tag is amd64-only
-# (checked against the registry), and the arm64 CUDA tag its docs mention does
-# not resolve. Reusing the vLLM image means one fewer dependency and a
-# guaranteed arm64 build.
-EMBED_IMAGE="${EMBED_IMAGE:-$VLLM_IMAGE}"
+# --- tunables (override via environment) -------------------------------------
+#
+# Only what is the same on every runtime is set here. The image, the weights,
+# the memory fractions, the batch size and the GPU the build expects come from
+# the runtime profile, which load_runtime sources once the command is known.
+
+# Runtime profiles, and the one used when nothing selects a runtime. It stays
+# dgx-spark because that is what every host provisioned before profiles existed
+# was running, and such a host has no SOSIM_RUNTIME recorded anywhere.
+RUNTIME_DIR="$ROOT/scripts/runtimes"
+DEFAULT_RUNTIME=dgx-spark
+
 FALKORDB_IMAGE="${FALKORDB_IMAGE:-falkordb/falkordb:latest}"
 FALKORDB_VOLUME="${FALKORDB_VOLUME:-sosim_falkordb}"
 
@@ -61,7 +74,6 @@ FALKORDB_VOLUME="${FALKORDB_VOLUME:-sosim_falkordb}"
 LEGACY_CONTAINERS=(mirofish-llm mirofish-embed mirofish-falkordb)
 LEGACY_VOLUME=mirofish_falkordb
 
-LLM_MODEL_REPO="${LLM_MODEL_REPO:-RedHatAI/Qwen3.6-35B-A3B-NVFP4}"
 LLM_SERVED_NAME="${LLM_SERVED_NAME:-local-llm}"
 EMBED_MODEL_REPO="${EMBED_MODEL_REPO:-BAAI/bge-m3}"
 
@@ -72,45 +84,6 @@ FALKORDB_UI_PORT="${FALKORDB_UI_PORT:-3001}"
 SHIM_PORT="${SHIM_PORT:-8088}"
 BACKEND_PORT="${BACKEND_PORT:-5001}"
 FRONTEND_PORT="${FRONTEND_PORT:-3000}"
-
-# Fraction of TOTAL device memory. On unified memory this competes with the OS,
-# the container runtime and the page cache. Published DGX Spark recipes range
-# 0.4–0.87; 0.90 has been observed getting the engine SIGTERM'd by earlyoom,
-# which does NOT look like an OOM in the logs. Start conservative.
-# NOTE: this is a fraction of TOTAL device memory, and the embeddings server is
-# a second vLLM process on the same pool, so the two must sum well under 1.0
-# alongside the OS and page cache.
-GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.70}"
-# bge-m3 is ~2.2GB of weights; it needs very little.
-EMBED_GPU_MEM_UTIL="${EMBED_GPU_MEM_UTIL:-0.08}"
-EMBED_MAX_MODEL_LEN="${EMBED_MAX_MODEL_LEN:-8192}"
-MAX_MODEL_LEN="${MAX_MODEL_LEN:-32768}"
-# vLLM will admit this many concurrent sequences. Decode on GB10 is
-# bandwidth-bound (~273 GB/s) and divides across sequences, so admitting 32
-# does not serve 32 at single-stream speed. Sweep before trusting a number.
-MAX_NUM_SEQS="${MAX_NUM_SEQS:-16}"
-# Qwen3 family. This MUST match the tool-call dialect the model actually emits,
-# and hermes — the old default here — does not match the shipped
-# RedHatAI/Qwen3.6-35B-A3B-NVFP4. That build emits the XML form
-# (<function=name><parameter=x>...), hermes expects JSON inside <tool_call>, and
-# every single agent request therefore died in the server with:
-#
-#   ERROR hermes_tool_parser.py:139 Error in extracting tool call from response
-#   json.decoder.JSONDecodeError: Expecting value: line 2 column 1 (char 1)
-#
-# That failure is close to invisible from the client: vLLM logs the traceback,
-# then returns 200 with the unparsed markup dumped into message.content. OASIS
-# sees an answer carrying no tool call, records no action, and the run reports
-# full rounds against an empty action log — which is exactly how it presented,
-# as a simulation that "ran" for 7.7 hours and produced nothing.
-#
-# Measured on a DGX Spark (2026-09-14): with qwen3_xml the preflight returns
-# finish_reason=tool_calls in 8.1s; with hermes the identical request comes back
-# as prose. Change this only for a model whose dialect you have checked, and
-# check it with:
-#
-#   backend/.venv/bin/python backend/scripts/run_parallel_simulation.py --preflight-only
-TOOL_CALL_PARSER="${TOOL_CALL_PARSER:-qwen3_xml}"
 
 # How containers are given the GPU. `--gpus all` suits the legacy nvidia
 # runtime; hosts wired up through CDI may need `--device nvidia.com/gpu=all`
@@ -123,7 +96,10 @@ NODE_MAJOR_REQUIRED=20   # vite 7 needs ^20.19 || >=22.12
 # Health-gate patience, in 2-second polls. Raise these on slower storage (a
 # first model load reads tens of GB); lower them to fail fast while testing.
 EMBED_WAIT_TRIES="${EMBED_WAIT_TRIES:-180}"      # ~6 min
-LLM_WAIT_TRIES="${LLM_WAIT_TRIES:-300}"          # ~10 min
+# The LLM's own patience is left to the runtime profile, which knows how long a
+# first load (weights, compile, CUDA graphs) takes there; load_runtime falls
+# back to 300 (~10 min).
+LLM_WAIT_TRIES="${LLM_WAIT_TRIES:-}"
 SHIM_WAIT_TRIES="${SHIM_WAIT_TRIES:-90}"         # ~3 min
 BACKEND_WAIT_TRIES="${BACKEND_WAIT_TRIES:-90}"
 FRONTEND_WAIT_TRIES="${FRONTEND_WAIT_TRIES:-90}"
@@ -211,8 +187,8 @@ report_failures() {
     printf '  %s%s.%s %s\n' "$R" "$i" "$N" "$f" >&2
     i=$((i + 1))
   done
-  printf '\n  Inspect a service:  %s logs [llm|embed|falkordb|zep-shim|backend|frontend]\n' "$0" >&2
-  printf '  Re-check config:    %s doctor\n\n' "$0" >&2
+  printf '\n  Inspect a service:  %s logs [llm|embed|falkordb|zep-shim|backend|frontend]\n' "$SELF" >&2
+  printf '  Re-check config:    %s doctor\n\n' "$SELF" >&2
   return 1
 }
 
@@ -250,6 +226,388 @@ probe_embedding_dim() {
   run_bounded 30 curl -fsS "http://127.0.0.1:$EMBED_PORT/v1/embeddings" \
     -H 'Content-Type: application/json' -d "$body" 2>/dev/null \
     | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["data"][0]["embedding"]))' 2>/dev/null
+}
+
+# =============================================================================
+# runtime profile
+# =============================================================================
+#
+# A runtime profile (scripts/runtimes/<name>.sh) holds every default that
+# depends on the hardware: the vLLM image and how it is entered, the weights,
+# the memory fractions, context length, batch size, and the GPU and CPU
+# architecture the combination was chosen for. Which profile applies, most
+# explicit first:
+#
+#   1. --runtime <name> (what the wrappers, scripts/provision_dgx_spark.sh and
+#      scripts/provision_l40s.sh, pass), or
+#      SOSIM_RUNTIME in the environment;
+#   2. SOSIM_RUNTIME in .env, which `setup` records, so that a later bare
+#      `provision_local.sh start` on the same host gets the same profile back;
+#   3. the one profile whose CPU architecture AND GPU compute capability both
+#      match this host — so a bare command on an L40S whose .env was wiped does
+#      not quietly start the DGX image with memory fractions sized for 128GB;
+#   4. dgx-spark. A host provisioned before profiles existed has no record, and
+#      must go on getting exactly what it always got. (A GB10 is also what
+#      step 3 finds on such a host, so the two agree there.)
+#
+# An explicit choice that contradicts the record is refused for the commands
+# that act on it. The .env was set up for the recorded runtime and the weights
+# on disk are that runtime's, so obeying would start a model that was never
+# downloaded — which fails minutes later inside vLLM, not here.
+
+RUNTIME=""
+RUNTIME_SOURCE=""
+RUNTIME_ARG=""
+
+runtime_names() {
+  local f
+  for f in "$RUNTIME_DIR"/*.sh; do
+    [[ -f "$f" ]] || continue
+    f="${f##*/}"
+    printf '%s\n' "${f%.sh}"
+  done
+}
+
+list_runtimes() {
+  step "Runtime profiles (scripts/runtimes/)"
+  local name label recorded
+  recorded="$(env_file_value SOSIM_RUNTIME)"
+  for name in $(runtime_names); do
+    label=$(sed -n 's/^RUNTIME_LABEL="\(.*\)"$/\1/p' "$RUNTIME_DIR/$name.sh" | head -1)
+    printf '  %-10s %s\n' "$name" "$label"
+    if [[ "$name" == "$recorded" ]]; then
+      printf '  %-10s run: %s  %s(recorded in .env)%s\n' "" "$(runtime_launcher "$name")" "$G" "$N"
+    else
+      printf '  %-10s run: %s\n' "" "$(runtime_launcher "$name")"
+    fi
+  done
+  if [[ -z "$recorded" ]]; then
+    local detected
+    detected="$(detect_runtime)"
+    if [[ -n "$detected" ]]; then
+      note "no runtime recorded in .env; bare commands use $detected (detected from the GPU)"
+    else
+      note "no runtime recorded in .env; bare commands use $DEFAULT_RUNTIME (the default)"
+    fi
+  fi
+}
+
+# detect_runtime
+# Print the single profile whose RUNTIME_HOST_ARCH and RUNTIME_COMPUTE_CAP both
+# match this host, or nothing — when the GPU cannot be queried, when no profile
+# fits, and when more than one does (guessing between them would be worse than
+# the documented default).
+detect_runtime() {
+  have nvidia-smi || return 0
+  local cap arch name match=""
+  cap=$(run_bounded 20 nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null \
+        | head -1 | tr -d ' ') || return 0
+  [[ "$cap" =~ ^[0-9]+\.[0-9]+$ ]] || return 0
+  arch="$(uname -m)"
+  for name in $(runtime_names); do
+    # shellcheck disable=SC1090
+    if ( source "$RUNTIME_DIR/$name.sh" >/dev/null 2>&1 \
+         && [[ "${RUNTIME_HOST_ARCH:-}" == "$arch" && " ${RUNTIME_COMPUTE_CAP:-} " == *" $cap "* ]] ); then
+      [[ -z "$match" ]] || return 0
+      match="$name"
+    fi
+  done
+  printf '%s' "$match"
+}
+
+# load_runtime <command>
+load_runtime() {
+  local cmd="$1" recorded detected="" detect_ran=0
+  recorded="$(env_file_value SOSIM_RUNTIME)"
+
+  # Only the commands that act on the hardware probe it. stop, logs and test use
+  # nothing from the profile, and a wedged driver is exactly when someone runs
+  # `stop` — it must not wait on nvidia-smi first.
+  local probe=0
+  case "$cmd" in setup|start|all|doctor|runtimes) probe=1 ;; esac
+
+  if [[ -n "$RUNTIME_ARG" ]]; then
+    RUNTIME="$RUNTIME_ARG"; RUNTIME_SOURCE="--runtime"
+  elif [[ -n "${SOSIM_RUNTIME:-}" ]]; then
+    RUNTIME="$SOSIM_RUNTIME"; RUNTIME_SOURCE="SOSIM_RUNTIME in the environment"
+  elif [[ -n "$recorded" ]]; then
+    RUNTIME="$recorded"; RUNTIME_SOURCE="recorded in .env"
+  else
+    if (( probe )); then detected="$(detect_runtime)"; detect_ran=1; fi
+    if [[ -n "$detected" ]]; then
+      RUNTIME="$detected"; RUNTIME_SOURCE="detected from this host's GPU"
+    elif (( probe )); then
+      RUNTIME="$DEFAULT_RUNTIME"; RUNTIME_SOURCE="default"
+    else
+      RUNTIME="$DEFAULT_RUNTIME"; RUNTIME_SOURCE="none recorded; not probed for '$cmd'"
+    fi
+  fi
+
+  local profile="$RUNTIME_DIR/$RUNTIME.sh"
+  if [[ ! "$RUNTIME" =~ ^[a-z0-9][a-z0-9-]*$ || ! -f "$profile" ]]; then
+    die "unknown runtime '$RUNTIME' ($RUNTIME_SOURCE). Available: $(runtime_names | tr '\n' ' ')"
+  fi
+
+  # Refuse, for the commands that create containers or write .env, a runtime
+  # this host positively belongs to another profile for: the other wrapper run
+  # by mistake, or an .env carried over from the other machine. Positively
+  # means detect_runtime named exactly one other profile — a host whose GPU
+  # cannot be queried, or matches no profile, is let through as before, so a
+  # DGX Spark (which always detects as dgx-spark) can never trip this.
+  local hw=""
+  case "$cmd" in
+    setup|start|all)
+      if [[ "${SOSIM_FORCE_RUNTIME:-0}" != 1 ]]; then
+        # One probe per invocation: if detection already ran above, its answer
+        # (a name, or nothing) is the answer here too.
+        if (( detect_ran )); then hw="$detected"; else hw="$(detect_runtime)"; fi
+      fi
+      ;;
+  esac
+
+  if [[ -n "$recorded" && "$recorded" != "$RUNTIME" ]]; then
+    local keep
+    keep="$(runtime_launcher "$recorded")"
+    case "$cmd" in
+      setup|start|all)
+        printf '\n%sERROR:%s this host was set up for runtime %s (SOSIM_RUNTIME in .env),\n' "$R" "$N" "'$recorded'" >&2
+        printf '       but %s asks for %s.\n\n' "$RUNTIME_SOURCE" "'$RUNTIME'" >&2
+        if [[ "$hw" == "$RUNTIME" ]]; then
+          printf '  This host looks like %s, not %s, so the record is probably wrong -\n' "'$RUNTIME'" "'$recorded'" >&2
+          printf '  an .env copied from another machine. Delete the SOSIM_RUNTIME line from\n' >&2
+          printf '  .env, review the concurrency keys in it against scripts/runtimes/%s.sh,\n' "$RUNTIME" >&2
+          printf '  and run setup again with the runtime you want.\n\n' >&2
+        else
+          printf '  The .env and the downloaded weights belong to %s. To keep using it:\n' "'$recorded'" >&2
+          printf '      %s %s\n\n' "$keep" "$cmd" >&2
+          printf '  To really switch this host to %s: stop the stack, delete the\n' "'$RUNTIME'" >&2
+          printf '  SOSIM_RUNTIME line from .env, review the concurrency keys in it against\n' >&2
+          printf '  scripts/runtimes/%s.sh, then run setup again (it fetches the new weights).\n\n' "$RUNTIME" >&2
+        fi
+        exit 1
+        ;;
+      *)
+        warn "this host was set up for runtime '$recorded' (.env), but $RUNTIME_SOURCE asks for '$RUNTIME'"
+        ;;
+    esac
+  elif [[ -n "$hw" && "$hw" != "$RUNTIME" ]]; then
+    printf '\n%sERROR:%s this host'"'"'s CPU and GPU match runtime %s, but %s selects %s.\n\n' \
+      "$R" "$N" "'$hw'" "$RUNTIME_SOURCE" "'$RUNTIME'" >&2
+    printf '  For this host:  %s %s\n' "$(runtime_launcher "$hw")" "$cmd" >&2
+    [[ "$RUNTIME_SOURCE" == "recorded in .env" ]] && \
+      printf '  If the SOSIM_RUNTIME line in .env came from another machine, delete it.\n' >&2
+    printf '  To use %s here anyway: SOSIM_FORCE_RUNTIME=1 %s %s\n\n' "'$RUNTIME'" "$(runtime_launcher "$RUNTIME")" "$cmd" >&2
+    exit 1
+  fi
+
+  # shellcheck disable=SC1090
+  source "$profile"
+
+  # A profile that forgets a key would otherwise surface as an unbound-variable
+  # abort deep inside start, or — worse — as `docker run` with an empty flag.
+  local key missing=()
+  for key in RUNTIME_LABEL RUNTIME_HOST_ARCH RUNTIME_COMPUTE_CAP RUNTIME_TORCH_ARCH \
+             VLLM_IMAGE LLM_MODEL_REPO GPU_MEM_UTIL EMBED_GPU_MEM_UTIL \
+             EMBED_MAX_MODEL_LEN MAX_MODEL_LEN MAX_NUM_SEQS TOOL_CALL_PARSER \
+             DROP_PAGE_CACHE GPU_START_ORDER HIDE_GPU_FROM_APP; do
+    [[ -n "${!key:-}" ]] || missing+=("$key")
+  done
+  (( ${#missing[@]} == 0 )) || die "runtime profile $profile does not set: ${missing[*]}"
+
+  VLLM_ENTRYPOINT="${VLLM_ENTRYPOINT:-}"
+  LLM_WAIT_TRIES="${LLM_WAIT_TRIES:-300}"
+  LLM_MODEL_REVISION="${LLM_MODEL_REVISION:-}"
+  ENV_SEED="${ENV_SEED:-}"
+  LLM_EXTRA_ARGS="${LLM_EXTRA_ARGS:-}"
+  EMBED_EXTRA_ARGS="${EMBED_EXTRA_ARGS:-}"
+  GPU_MEM_PRECHECK="${GPU_MEM_PRECHECK:-0}"
+  # What the embeddings server really occupies on the card (bge-m3 in fp16 plus
+  # its CUDA context), for GPU_MEM_PRECHECK. Its --gpu-memory-utilization is only
+  # a startup floor, not a reservation.
+  EMBED_EXPECTED_MIB="${EMBED_EXPECTED_MIB:-3072}"
+
+  # Embeddings run on the SAME vLLM image. HuggingFace TEI was the obvious
+  # choice but publishes no arm64 image at all — every cpu-* tag is amd64-only
+  # (checked against the registry), and the arm64 CUDA tag its docs mention does
+  # not resolve. Reusing the vLLM image means one fewer dependency and a
+  # guaranteed arm64 build.
+  EMBED_IMAGE="${EMBED_IMAGE:-$VLLM_IMAGE}"
+
+  finalize_runtime
+}
+
+# finalize_runtime
+# Validate, and derive from, the values that .env may also set. Runs once the
+# profile is loaded and again after load_env sources .env, so that a value .env
+# supplies is both checked and actually used (the GPU-hiding prefix, above all,
+# must follow HIDE_GPU_FROM_APP as it finally stands).
+finalize_runtime() {
+  [[ "$MAX_NUM_SEQS" =~ ^[0-9]+$ ]] || die "MAX_NUM_SEQS='$MAX_NUM_SEQS' is not an integer"
+  case "$GPU_START_ORDER" in
+    parallel|serial) ;;
+    *) die "GPU_START_ORDER='$GPU_START_ORDER' must be 'parallel' or 'serial'" ;;
+  esac
+  case "${VLLM_ENTRYPOINT:-}" in
+    ''|vllm) ;;
+    *) die "VLLM_ENTRYPOINT='$VLLM_ENTRYPOINT' must be empty (keep the image's entrypoint) or 'vllm'" ;;
+  esac
+
+  # Prefix for SoSim's own Python processes (backend, shim, doctor's preflight):
+  # the backend's x86_64 torch has CUDA, and OASIS would take the GPU if it could
+  # see it — see start_backend. Empty keeps the command exactly as it was.
+  APP_ENV=()
+  if [[ "$HIDE_GPU_FROM_APP" == 1 ]]; then
+    APP_ENV=(env CUDA_VISIBLE_DEVICES=)
+  fi
+}
+
+# runtime_launcher <name>: the command that runs a runtime — its wrapper if it
+# has one (dgx-spark -> scripts/provision_dgx_spark.sh), else the engine.
+runtime_launcher() {
+  local wrapper="scripts/provision_${1//-/_}.sh"
+  if [[ -x "$ROOT/$wrapper" ]]; then
+    printf '%s' "$wrapper"
+  else
+    printf '%s' "scripts/provision_local.sh --runtime $1"
+  fi
+}
+
+# check_runtime_hardware
+# Compare this host with the hardware the runtime profile was written for. The
+# wrong profile does not fail cleanly: memory fractions sized for a 128GB
+# unified pool on a 48GB card, an image whose kernels skip this GPU, or weights
+# that were never downloaded here all fail minutes later inside vLLM, or serve
+# badly, or OOM. A GPU that cannot be queried is reported and let through — the
+# containers are the definitive test, and start_llm dumps their logs if they
+# cannot get a device.
+RUNTIME_CHECKED=0
+check_runtime_hardware() {
+  (( RUNTIME_CHECKED == 0 )) || return 0
+  RUNTIME_CHECKED=1
+  step "Runtime: $RUNTIME ($RUNTIME_SOURCE)"
+  note "$RUNTIME_LABEL — scripts/runtimes/$RUNTIME.sh"
+
+  local host_arch
+  host_arch="$(uname -m)"
+  if [[ "$host_arch" == "$RUNTIME_HOST_ARCH" ]]; then
+    ok "host arch $host_arch"
+  else
+    fail "this host is $host_arch, but runtime '$RUNTIME' is for $RUNTIME_HOST_ARCH (see: $SELF runtimes)"
+  fi
+
+  if ! have nvidia-smi; then
+    note "nvidia-smi not found; the GPU was not checked against the runtime"
+    return 0
+  fi
+  # One bounded query: a wedged driver must not stall start here (see run_bounded).
+  local line gpu cap rc=0
+  line=$(run_bounded 20 nvidia-smi --query-gpu=name,compute_cap --format=csv,noheader 2>/dev/null | head -1) || rc=$?
+  if (( rc == 124 )); then
+    # Timed out: the driver is not answering, and every further query would
+    # only wait out its own deadline too.
+    warn "nvidia-smi did not answer within 20s; the GPU was not checked against the runtime"
+    return 0
+  fi
+  gpu="${line%,*}"
+  cap="${line##*,}"; cap="${cap// /}"
+  if [[ ! "$cap" =~ ^[0-9]+\.[0-9]+$ ]]; then
+    note "GPU ${gpu:-unknown}: compute capability not reported, so not checked"
+  elif [[ " $RUNTIME_COMPUTE_CAP " == *" $cap "* ]]; then
+    ok "GPU $gpu, compute capability $cap"
+  else
+    fail "GPU $gpu has compute capability $cap; runtime '$RUNTIME' was built for $RUNTIME_COMPUTE_CAP"
+    warn "  Its image and weights may not load here at all. List the alternatives with"
+    warn "  '$SELF runtimes'."
+  fi
+
+  # An NVIDIA vGPU guest (the L40S-48C is one) is throttled once it is found
+  # unlicensed, and a simulation run lasts hours. Only a guest that reports
+  # itself as a vGPU is judged: bare-metal GPUs may print a license line of
+  # their own (often N/A), and that means nothing here.
+  local smi_q vmode license
+  smi_q=$(run_bounded 30 nvidia-smi -q 2>/dev/null) || smi_q=""
+  vmode=$(sed -n 's/^[[:space:]]*Virtualization Mode[[:space:]]*:[[:space:]]*//p' <<<"$smi_q" | head -1)
+  if [[ "$vmode" == VGPU* ]]; then
+    license=$(sed -n 's/^[[:space:]]*License Status[[:space:]]*:[[:space:]]*//p' <<<"$smi_q" | head -1)
+    if [[ "$license" == Licensed* ]]; then
+      ok "vGPU license: $license"
+    else
+      fail "vGPU license status is '${license:-not reported}'"
+      warn "  An unlicensed vGPU runs at full speed only briefly before NVIDIA's driver"
+      warn "  degrades it, which a multi-hour simulation will not survive. Check with:"
+      warn "      nvidia-smi -q | grep -i -A2 license"
+    fi
+  fi
+
+  return 0
+}
+
+# check_gpu_memory
+# Discrete cards only (GPU_MEM_PRECHECK=1). vLLM refuses to start unless the
+# device has --gpu-memory-utilization x total FREE at that moment, and both
+# servers draw on the same card. Runs after .env is read, so it judges the
+# fractions start will really use. Skipped while the LLM runs — its own usage is
+# then part of the picture; with only the embeddings server up (the usual state
+# while recreating the LLM), what that server uses is already out of "free".
+check_gpu_memory() {
+  [[ "$GPU_MEM_PRECHECK" == 1 ]] || return 0
+  container_up sosim-llm && return 0
+  local embed_up=0
+  container_up sosim-embed && embed_up=1
+  local mem total free
+  mem=$(run_bounded 20 nvidia-smi --query-gpu=memory.total,memory.free --format=csv,noheader,nounits 2>/dev/null | head -1) || mem=""
+  total="${mem%,*}"; total="${total// /}"
+  free="${mem##*,}"; free="${free// /}"
+  [[ "$total" =~ ^[0-9]+$ && "$free" =~ ^[0-9]+$ ]] || return 0
+  # FREE, not total minus used: a vGPU can hold part of its framebuffer in
+  # reserve, and that part is neither used nor available.
+  #
+  # With the servers started one after the other, the LLM needs
+  # GPU_MEM_UTIL x total free once the embeddings server has taken what it
+  # really uses (EMBED_EXPECTED_MIB) — below that vLLM refuses to start.
+  # Charging the embeddings server its whole --gpu-memory-utilization instead
+  # is only a comfort margin: short of it, things still start.
+  local need comfort
+  if (( embed_up )); then
+    need=$(awk -v t="$total" -v a="$GPU_MEM_UTIL" 'BEGIN { printf "%d", t * a }')
+    comfort=$need
+  else
+    need=$(awk -v t="$total" -v a="$GPU_MEM_UTIL" -v e="$EMBED_EXPECTED_MIB" \
+             'BEGIN { printf "%d", t * a + e }')
+    comfort=$(awk -v t="$total" -v a="$GPU_MEM_UTIL" -v b="$EMBED_GPU_MEM_UTIL" \
+             'BEGIN { printf "%d", t * (a + b) }')
+  fi
+  if (( free < need )); then
+    fail "GPU memory: ${free}MiB free of ${total}MiB, but the LLM (GPU_MEM_UTIL=$GPU_MEM_UTIL)$( (( embed_up )) || printf ' and the embeddings server') need ~${need}MiB — vLLM will refuse to start"
+    warn "  Whatever holds that memory has to go, or GPU_MEM_UTIL comes down:"
+    run_bounded 20 nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader 2>/dev/null \
+      | sed 's/^/      /' >&2 || true
+  elif (( free < comfort )); then
+    warn "GPU memory: ${free}MiB free of ${total}MiB — enough to start (~${need}MiB), but thin"
+    warn "  against GPU_MEM_UTIL + EMBED_GPU_MEM_UTIL (${comfort}MiB). Watch for OOMs under load."
+  else
+    ok "GPU memory: ${free}MiB free of ${total}MiB; ~${need}MiB is needed"
+  fi
+  return 0
+}
+
+# warn_missing_env_seed
+# A runtime's ENV_SEED keys are written only into an .env that setup creates or
+# first records the runtime in. An .env made any other way — copied by hand,
+# carried over from another host, the offline wipe path — can lack them; say so
+# here rather than let the first simulation find out.
+warn_missing_env_seed() {
+  [[ -n "${ENV_SEED:-}" ]] || return 0
+  local seed_line key
+  while IFS= read -r seed_line; do
+    [[ "$seed_line" == *=* ]] || continue
+    key="${seed_line%%=*}"
+    if ! grep -qE "^${key}=" "$ROOT/.env" 2>/dev/null; then
+      warn "runtime '$RUNTIME' expects $key in .env and it is not set. Add this line:"
+      warn "    $seed_line"
+    fi
+  done <<<"$ENV_SEED"
+  return 0
 }
 
 # =============================================================================
@@ -304,6 +662,8 @@ preflight() {
   else
     ok "disk: ${free_gb}GB free"
   fi
+
+  check_runtime_hardware
 }
 
 # =============================================================================
@@ -393,11 +753,43 @@ init_submodule() {
 make_env() {
   step "Environment file"
   mkdir -p "$DATA_DIR" "$RUN_DIR" "$LOG_DIR" "$HF_CACHE"
+  local fresh_env=0
   if [[ -f "$ROOT/.env" ]]; then
     ok ".env exists (left untouched)"
   else
     cp "$ROOT/.env.example" "$ROOT/.env"
+    fresh_env=1
     ok "created .env from .env.example"
+  fi
+  # Record the runtime, so a later bare `provision_local.sh start` on this host
+  # loads the same profile instead of the dgx-spark fallback. load_runtime has
+  # already refused a --runtime that disagrees with an existing record, so this
+  # only ever writes a key that is absent.
+  local new_record=0
+  [[ -n "$(env_file_value SOSIM_RUNTIME)" ]] || new_record=1
+  if (( new_record )) && grep -qE '^SOSIM_RUNTIME=' "$ROOT/.env"; then
+    # The line is there but empty — blanked rather than deleted — so nothing is
+    # recorded and ensure_env_key would leave it that way. The last assignment
+    # wins for both `source` and env_file_value, so append.
+    printf '\n# Added by provision_local.sh — %s\nSOSIM_RUNTIME=%s\n' \
+      "the runtime profile (scripts/runtimes/$RUNTIME.sh) this host was set up for" "$RUNTIME" >>"$ROOT/.env"
+    ok "set SOSIM_RUNTIME=$RUNTIME in .env"
+  else
+    ensure_env_key SOSIM_RUNTIME "$RUNTIME" \
+      "the runtime profile (scripts/runtimes/$RUNTIME.sh) this host was set up for"
+  fi
+
+  # Keys the runtime profile wants in its .env (ENV_SEED, one KEY=VALUE per line,
+  # the value written exactly as given): into a copy made just now, or an .env
+  # that is only now being recorded for this runtime (a host switching to it).
+  # Only ever ADDED when absent — a value the operator set, even to something
+  # else, is theirs and is never rewritten.
+  if (( fresh_env || new_record )) && [[ -n "$ENV_SEED" ]]; then
+    local seed_line
+    while IFS= read -r seed_line; do
+      [[ "$seed_line" == *=* ]] || continue
+      ensure_env_key "${seed_line%%=*}" "${seed_line#*=}" "seeded by the $RUNTIME runtime profile"
+    done <<<"$ENV_SEED"
   fi
   # Keep the served model name in .env consistent with what vLLM will answer to.
   if ! grep -q "^LLM_MODEL_NAME=$LLM_SERVED_NAME$" "$ROOT/.env" 2>/dev/null; then
@@ -500,7 +892,7 @@ ensure_env_key() {
   local key="$1" value="$2" why="${3:-}" current
   if grep -qE "^${key}=" "$ROOT/.env" 2>/dev/null; then
     current=$(unquote_env_value "$(grep -E "^${key}=" "$ROOT/.env" | head -1 | cut -d= -f2-)")
-    if [[ "$current" != "$value" ]]; then
+    if [[ "$current" != "$(unquote_env_value "$value")" ]]; then
       note "$key=$current in .env (this host suggests $value)"
     fi
     return 0
@@ -573,7 +965,7 @@ check_ingest_budget() {
     warn "  server is a second vLLM on the same GPU. The excess queues, and the wait counts"
     warn "  against each request's own timeout — this is exactly how a 62-episode"
     warn "  build spent 50 minutes and then died on one openai.APITimeoutError."
-    warn "  Lower either key in .env, or raise MAX_NUM_SEQS and re-run '$0 setup'."
+    warn "  Lower either key in .env, or raise MAX_NUM_SEQS and re-run '$SELF setup'."
     return 1
   fi
   ok "ingest concurrency $batch x $fanout = $peak (budget $budget, --max-num-seqs=$MAX_NUM_SEQS)"
@@ -628,11 +1020,16 @@ fetch_models() {
   fi
   note "using: $hf_bin"
 
-  for repo in "$LLM_MODEL_REPO" "$EMBED_MODEL_REPO"; do
-    note "downloading $repo"
-    HF_HUB_OFFLINE=0 vrun "$hf_bin" download "$repo" \
-      || fail "failed to download model weights: $repo"
-  done
+  # LLM_MODEL_REVISION pins the LLM to one commit of its repo, for checkpoints
+  # whose weights have been replaced in place. Unset, `main` is fetched as ever.
+  local rev_args=()
+  [[ -n "$LLM_MODEL_REVISION" ]] && rev_args=(--revision "$LLM_MODEL_REVISION")
+  note "downloading $LLM_MODEL_REPO${LLM_MODEL_REVISION:+ @ $LLM_MODEL_REVISION}"
+  HF_HUB_OFFLINE=0 vrun "$hf_bin" download "$LLM_MODEL_REPO" ${rev_args[@]+"${rev_args[@]}"} \
+    || fail "failed to download model weights: $LLM_MODEL_REPO"
+  note "downloading $EMBED_MODEL_REPO"
+  HF_HUB_OFFLINE=0 vrun "$hf_bin" download "$EMBED_MODEL_REPO" \
+    || fail "failed to download model weights: $EMBED_MODEL_REPO"
 
   # A Twitter simulation loads this at runtime; a Reddit-only run never does.
   # Fetch it now or the first Twitter run fails with HF_HUB_OFFLINE=1 set.
@@ -668,11 +1065,25 @@ pull_images() {
 
 # shellcheck disable=SC1090
 load_env() {
-  [[ -f "$ROOT/.env" ]] || die ".env missing. Run: $0 setup"
+  [[ -f "$ROOT/.env" ]] || die ".env missing. Run: $SELF setup"
   set -a
   source "$ROOT/.env"
   set +a
-  export HF_HOME="${HF_HOME:-$HF_CACHE}"
+  # .env writes HF_HOME relative to the repo root (./data/hf-cache), and nothing
+  # started from here runs in the repo root: the backend runs in backend/ and
+  # each simulation in its own directory, where a relative HF_HOME points at
+  # nothing and the offline Twitter recommender cannot be found. The backend and
+  # the simulation scripts pin it themselves too (backend/scripts/env_paths.py);
+  # this covers everything else this script launches.
+  HF_HOME="${HF_HOME:-$HF_CACHE}"
+  case "$HF_HOME" in
+    /*|\~*) ;;
+    *) HF_HOME="$ROOT/${HF_HOME#./}" ;;
+  esac
+  export HF_HOME
+  # .env may set runtime values too (it always could override the tunables);
+  # re-check them and rebuild what derives from them.
+  finalize_runtime
 }
 
 # Wait for an HTTP endpoint. On failure the caller gets a dumped log, so a
@@ -781,7 +1192,65 @@ warn_if_llm_flags_stale() {
     warn "the RUNNING container serves --tool-call-parser $live_parser, not $TOOL_CALL_PARSER."
     warn "  A parser that does not match the model still returns 200, with the tool call"
     warn "  left unparsed in the message content — so agents record no actions. To apply"
-    warn "  the current setting:  docker rm -f sosim-llm && $0 start"
+    warn "  the current setting:  docker rm -f sosim-llm && $SELF start"
+  fi
+
+  # Sizing flags only take effect when the container is created, so an override
+  # given to `start` while it runs (GPU_MEM_UTIL=0.85 ... start) changes nothing.
+  local pair flag want have_val
+  for pair in "--gpu-memory-utilization=$GPU_MEM_UTIL" "--max-num-seqs=$MAX_NUM_SEQS" \
+              "--max-model-len=$MAX_MODEL_LEN"; do
+    flag="${pair%%=*}"; want="${pair#*=}"; have_val=""
+    if [[ "$live" =~ $flag[[:space:]]+([^[:space:]]+) ]]; then
+      have_val="${BASH_REMATCH[1]}"
+    fi
+    if [[ -n "$have_val" && "$have_val" != "$want" ]]; then
+      warn "the RUNNING container has $flag $have_val, not $want — sizing applies only when"
+      warn "  the container is created:  docker rm -f sosim-llm && $SELF start"
+    fi
+  done
+
+  warn_if_container_stale sosim-llm "$VLLM_IMAGE" "$LLM_MODEL_REPO" "$live"
+}
+
+# warn_if_container_stale <container> <image> <model> [live-args]
+# A container left over from another runtime profile (or an older default) keeps
+# answering on the same port under the same served name, and --restart
+# unless-stopped brings it back after every reboot, so nothing downstream can
+# tell. Say so where it can still be noticed. Silent when everything matches.
+warn_if_container_stale() {
+  local name="$1" image="$2" model="$3" live="${4:-}" live_image
+  if [[ -z "$live" ]]; then
+    live=$(docker inspect --format '{{join .Args " "}}' "$name" 2>/dev/null) || return 0
+  fi
+  if [[ -n "$live" && " $live " != *" $model "* ]]; then
+    warn "the RUNNING $name does not serve $model, which runtime '$RUNTIME' expects."
+    warn "  To apply the current setting:  docker rm -f $name && $SELF start"
+  fi
+  live_image=$(docker inspect --format '{{.Config.Image}}' "$name" 2>/dev/null) || live_image=""
+  if [[ -n "$live_image" && "$live_image" != "$image" ]]; then
+    warn "the RUNNING $name was created from $live_image, not $image."
+    warn "  To apply the current setting:  docker rm -f $name && $SELF start"
+  fi
+}
+
+# set_vllm_invocation <image>
+# Everything a vLLM `docker run` needs after its own flags: the image, and how
+# `vllm serve` is reached inside it. The NGC image's entrypoint execs whatever
+# command it is given, so it gets `vllm serve ...`. Upstream vllm/vllm-openai
+# bakes `vllm serve` into its ENTRYPOINT instead, and handed `vllm serve` again
+# it would run `vllm serve vllm serve <model>`; a runtime that uses such an
+# image sets VLLM_ENTRYPOINT=vllm, which replaces the entrypoint and leaves
+# `serve` as the first word of the command. Either way the container ends up
+# running the same `vllm serve <model> <flags>`.
+#
+# Written to the global VLLM_INVOCATION array: bash 3.2 has no namerefs.
+set_vllm_invocation() {
+  local image="$1"
+  if [[ "$VLLM_ENTRYPOINT" == vllm ]]; then
+    VLLM_INVOCATION=(--entrypoint vllm "$image" serve)
+  else
+    VLLM_INVOCATION=("$image" vllm serve)
   fi
 }
 
@@ -794,32 +1263,47 @@ start_llm() {
   fi
   docker rm -f sosim-llm >/dev/null 2>&1 || true
 
-  # Unified memory means the OS page cache eats into the KV cache budget.
-  note "dropping the page cache to free unified memory (sudo; skipped if refused)"
-  sync
-  run_bounded 20 sudo -n sh -c 'echo 3 > /proc/sys/vm/drop_caches' 2>/dev/null || \
-    note "page cache not dropped (needs passwordless sudo); fine, just less headroom"
+  # Unified memory means the OS page cache eats into the KV cache budget. On a
+  # discrete card it does not, and the runtime profile turns this off.
+  if [[ "$DROP_PAGE_CACHE" == 1 ]]; then
+    note "dropping the page cache to free unified memory (sudo; skipped if refused)"
+    sync
+    run_bounded 20 sudo -n sh -c 'echo 3 > /proc/sys/vm/drop_caches' 2>/dev/null || \
+      note "page cache not dropped (needs passwordless sudo); fine, just less headroom"
+  fi
 
   # Two independent needs, both served by this one endpoint:
   #  - OASIS agents use native OpenAI tool calling  -> the tool-call flags
   #  - Graphiti uses response_format json_schema    -> constrained decoding
   note "model=$LLM_MODEL_REPO  gpu-mem=$GPU_MEM_UTIL  max-len=$MAX_MODEL_LEN"
   note "max-num-seqs=$MAX_NUM_SEQS  tool-call-parser=$TOOL_CALL_PARSER"
+  [[ -n "$LLM_EXTRA_ARGS" ]] && note "extra flags ($RUNTIME): $LLM_EXTRA_ARGS"
+  set_vllm_invocation "$VLLM_IMAGE"
+  # The tokenizer is pinned too: offline, an unpinned tokenizer resolves `main`,
+  # which a revision-only download never recorded.
+  local rev_args=()
+  if [[ -n "$LLM_MODEL_REVISION" ]]; then
+    rev_args=(--revision "$LLM_MODEL_REVISION" --tokenizer-revision "$LLM_MODEL_REVISION")
+    note "revision=$LLM_MODEL_REVISION"
+  fi
+  # LLM_EXTRA_ARGS is split on whitespace on purpose, like GPU_FLAGS; the
+  # runtime profile documents what that allows.
+  # shellcheck disable=SC2086
   if ! vrun docker run -d --name sosim-llm --restart unless-stopped \
     $GPU_FLAGS --ipc=host \
     -p "127.0.0.1:$LLM_PORT:8000" \
     -v "$HF_CACHE:/hf" \
     -e HF_HOME=/hf -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 \
     -e HF_HUB_DISABLE_TELEMETRY=1 \
-    "$VLLM_IMAGE" \
-    vllm serve "$LLM_MODEL_REPO" \
+    "${VLLM_INVOCATION[@]}" "$LLM_MODEL_REPO" \
       --served-model-name "$LLM_SERVED_NAME" \
       --host 0.0.0.0 --port 8000 \
       --gpu-memory-utilization "$GPU_MEM_UTIL" \
       --max-model-len "$MAX_MODEL_LEN" \
       --max-num-seqs "$MAX_NUM_SEQS" \
       --enable-auto-tool-choice \
-      --tool-call-parser "$TOOL_CALL_PARSER" >/dev/null; then
+      --tool-call-parser "$TOOL_CALL_PARSER" \
+      ${rev_args[@]+"${rev_args[@]}"} $LLM_EXTRA_ARGS >/dev/null; then
     fail "could not create the vLLM container"
     return 1
   fi
@@ -830,24 +1314,31 @@ start_llm() {
 
 start_embeddings() {
   step "Embeddings server"
-  if container_up sosim-embed; then ok "already running"; return; fi
+  if container_up sosim-embed; then
+    ok "already running"
+    warn_if_container_stale sosim-embed "$EMBED_IMAGE" "$EMBED_MODEL_REPO"
+    return
+  fi
   docker rm -f sosim-embed >/dev/null 2>&1 || true
   # vLLM in pooling mode exposes an OpenAI-compatible /v1/embeddings.
   # `--runner pooling` supersedes the older `--task embed`; copying an older
   # recipe with --task embed will fail on a current image.
   note "model=$EMBED_MODEL_REPO  gpu-mem=$EMBED_GPU_MEM_UTIL"
+  [[ -n "$EMBED_EXTRA_ARGS" ]] && note "extra flags ($RUNTIME): $EMBED_EXTRA_ARGS"
+  set_vllm_invocation "$EMBED_IMAGE"
+  # shellcheck disable=SC2086
   if ! vrun docker run -d --name sosim-embed --restart unless-stopped \
     $GPU_FLAGS --ipc=host \
     -p "127.0.0.1:$EMBED_PORT:8000" \
     -v "$HF_CACHE:/hf" \
     -e HF_HOME=/hf -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 \
     -e HF_HUB_DISABLE_TELEMETRY=1 \
-    "$EMBED_IMAGE" \
-    vllm serve "$EMBED_MODEL_REPO" \
+    "${VLLM_INVOCATION[@]}" "$EMBED_MODEL_REPO" \
       --runner pooling \
       --host 0.0.0.0 --port 8000 \
       --gpu-memory-utilization "$EMBED_GPU_MEM_UTIL" \
-      --max-model-len "$EMBED_MAX_MODEL_LEN" >/dev/null; then
+      --max-model-len "$EMBED_MAX_MODEL_LEN" \
+      $EMBED_EXTRA_ARGS >/dev/null; then
     fail "could not create the embeddings container"
     return 1
   fi
@@ -907,7 +1398,7 @@ start_shim() {
   local shim_dir="$ROOT/third_party/graphiti/server"
   local venv="$shim_dir/.venv/bin/python"
   if [[ ! -x "$venv" ]]; then
-    fail "shim venv missing at $venv — run: $0 setup"
+    fail "shim venv missing at $venv — run: $SELF setup"
     return 1
   fi
 
@@ -951,7 +1442,9 @@ start_shim() {
     warn "in .env at it — as an absolute path — rather than deleting anything."
   fi
 
-  start_bg zep-shim "$shim_dir" \
+  # Same GPU hiding as the backend (start_backend): the shim only touches torch
+  # for GRAPHITI_RERANKER=bge, and that reranker must not land on the vLLM card.
+  start_bg zep-shim "$shim_dir" ${APP_ENV[@]+"${APP_ENV[@]}"} \
     "$venv" -m uvicorn graph_service.zep_compat.app:app \
     --host 127.0.0.1 --port "$SHIM_PORT"
 }
@@ -963,10 +1456,20 @@ start_backend() {
   # on `import oasis`.
   local venv="$ROOT/backend/.venv/bin/python"
   if [[ ! -x "$venv" ]]; then
-    fail "backend venv missing at $venv — run: $0 setup"
+    fail "backend venv missing at $venv — run: $SELF setup"
     return 1
   fi
-  start_bg backend "$ROOT/backend" "$venv" run.py
+  # On x86_64 the backend's PyPI torch ships CUDA, and OASIS puts its Twitter
+  # recommender on the GPU whenever torch can see one (oasis/social_platform/
+  # recsys.py). The vLLM servers have already claimed nearly all of a discrete
+  # card, so each simulation subprocess would either die on a CUDA OOM or take
+  # memory the KV cache was sized to have. Hiding the GPU gives these processes
+  # what they get on the DGX Spark anyway: CPU torch. Simulation children
+  # inherit the environment, so this covers them too.
+  if [[ "$HIDE_GPU_FROM_APP" == 1 ]]; then
+    note "GPU hidden from the backend and its simulations (CUDA_VISIBLE_DEVICES='')"
+  fi
+  start_bg backend "$ROOT/backend" ${APP_ENV[@]+"${APP_ENV[@]}"} "$venv" run.py
 }
 
 start_frontend() {
@@ -990,12 +1493,30 @@ do_start() {
   # Each step records its own failures and we deliberately continue, so one
   # broken service still yields a full picture instead of stopping at the first
   # problem. report_failures() (EXIT trap) sets the exit code.
+  # What check_runtime_hardware reports (a license, a mismatch, a tight card) is
+  # a warning about this host, not a service that failed to come up: count it
+  # with the "reported before startup" problems, still in the exit code.
+  local hw_before=${#FAILURES[@]}
+  check_runtime_hardware || true
+  check_gpu_memory || true
+  failures_at_start=$(( failures_at_start + ${#FAILURES[@]} - hw_before ))
+  warn_missing_env_seed
   start_falkordb        || true
   start_embeddings      || true
-  start_llm             || true
-
-  wait_for_http "http://127.0.0.1:$EMBED_PORT/v1/models" "embeddings" \
-    "$EMBED_WAIT_TRIES" embed || true
+  if [[ "$GPU_START_ORDER" == serial ]]; then
+    # One vLLM at a time. Each sizes its KV cache from what the device reports
+    # while it profiles, and on a discrete card with little slack a second
+    # server loading its weights at that moment is counted against the first
+    # (or trips vLLM's "Error in memory profiling" check). The embeddings server
+    # is small and quick, so it goes first and the LLM measures a settled GPU.
+    wait_for_http "http://127.0.0.1:$EMBED_PORT/v1/models" "embeddings" \
+      "$EMBED_WAIT_TRIES" embed || true
+    start_llm           || true
+  else
+    start_llm           || true
+    wait_for_http "http://127.0.0.1:$EMBED_PORT/v1/models" "embeddings" \
+      "$EMBED_WAIT_TRIES" embed || true
+  fi
   wait_for_http "http://127.0.0.1:$LLM_PORT/v1/models" "LLM" \
     "$LLM_WAIT_TRIES" llm || true
 
@@ -1049,7 +1570,7 @@ do_stop() {
 }
 
 do_status() {
-  step "Status"
+  step "Status  (runtime: $RUNTIME, $RUNTIME_SOURCE)"
   printf '  %-12s %-9s %s\n' SERVICE STATE ENDPOINT
   for row in "falkordb:sosim-falkordb:127.0.0.1:$FALKORDB_PORT" \
              "embeddings:sosim-embed:http://127.0.0.1:$EMBED_PORT/v1/models" \
@@ -1090,11 +1611,19 @@ do_logs() {
 
 do_test() {
   step "Test suites (no GPU, no network, no database)"
+  # The runtime profiles first: it stubs Docker and the GPU out entirely, needs
+  # no venv, and is what pins the DGX Spark containers against drift.
+  printf '\n  --- runtime profiles\n'
+  if vrun bash "$ROOT/scripts/tests/test_runtimes.sh"; then
+    ok "runtime profile checks passed"
+  else
+    fail "runtime profile checks failed (see the output above)"
+  fi
   local suite
   for suite in "backend:$ROOT/backend" "shim:$ROOT/third_party/graphiti/server"; do
     local label="${suite%%:*}" dir="${suite#*:}"
     if [[ ! -x "$dir/.venv/bin/python" ]]; then
-      fail "$label venv missing at $dir/.venv — run: $0 setup"
+      fail "$label venv missing at $dir/.venv — run: $SELF setup"
       continue
     fi
     printf '\n  --- %s\n' "$label"
@@ -1108,26 +1637,36 @@ do_test() {
 
 check_gpu_arch() {
   step "GPU architecture support in $VLLM_IMAGE"
-  # GB10 is sm_121. A torch that only compiles through sm_120 fails at runtime
-  # with errors that do not mention the architecture at all.
+  # The torch inside the image has to carry kernels this GPU can run
+  # (RUNTIME_TORCH_ARCH, from the runtime profile — sm_121 for GB10). A torch that
+  # only compiles through sm_120 fails on GB10 at runtime with errors that do not
+  # mention the architecture at all.
   local arches
   if ! docker image inspect "$VLLM_IMAGE" >/dev/null 2>&1; then
-    warn "$VLLM_IMAGE not pulled yet; run '$0 setup' first to check this"
+    warn "$VLLM_IMAGE not pulled yet; run '$SELF setup' first to check this"
     return 0
   fi
+  # Same entrypoint handling as the servers: an image whose ENTRYPOINT is
+  # `vllm serve` would treat `python -c ...` as a model name.
+  local probe=("$VLLM_IMAGE" python)
+  [[ "$VLLM_ENTRYPOINT" == vllm ]] && probe=(--entrypoint python3 "$VLLM_IMAGE")
   # Bounded, and only against an image already on disk — see run_bounded.
-  if arches=$(run_bounded 180 docker run --rm $GPU_FLAGS "$VLLM_IMAGE" \
-      python -c 'import torch; print(" ".join(torch.cuda.get_arch_list()))' 2>/dev/null); then
+  if arches=$(run_bounded 180 docker run --rm $GPU_FLAGS "${probe[@]}" \
+      -c 'import torch; print(" ".join(torch.cuda.get_arch_list()))' 2>/dev/null); then
     note "torch arch list: $arches"
-    if [[ "$arches" == *sm_121* || "$arches" == *sm_121a* ]]; then
-      ok "sm_121 present"
+    local want found=""
+    for want in $RUNTIME_TORCH_ARCH; do
+      [[ "$arches" == *"$want"* ]] && { found="$want"; break; }
+    done
+    if [[ -n "$found" ]]; then
+      ok "$found present"
     else
-      warn "sm_121 NOT in the arch list — this image may fail on GB10. Try another tag."
+      warn "$RUNTIME_TORCH_ARCH NOT in the arch list — this image may fail on this GPU. Try another tag."
     fi
   else
     warn "could not run the image with GPU access ($GPU_FLAGS)."
     warn "This doubles as the GPU passthrough test. If the LLM container also"
-    warn "fails, try: GPU_FLAGS='--device nvidia.com/gpu=all' $0 start"
+    warn "fails, try: GPU_FLAGS='--device nvidia.com/gpu=all' $SELF start"
   fi
 }
 
@@ -1137,7 +1676,7 @@ report_legacy_infra() {
   local found=0 c
   for c in "${LEGACY_CONTAINERS[@]}"; do
     if container_exists "$c"; then
-      warn "$c still exists and blocks the matching sosim-* container; '$0 start' removes it"
+      warn "$c still exists and blocks the matching sosim-* container; '$SELF start' removes it"
       found=1
     fi
   done
@@ -1152,26 +1691,68 @@ report_legacy_infra() {
 
 do_doctor() {
   step "Doctor"
+  # Judge everything against the values start uses: .env is read after the
+  # profile there, so it is here too.
+  if [[ -f "$ROOT/.env" ]]; then load_env; fi
   preflight
+  check_gpu_memory
   report_legacy_infra
   check_gpu_arch
 
-  step "arm64 manifests"
+  # Docker names architectures differently from uname.
+  local docker_arch
+  case "$(uname -m)" in
+    aarch64|arm64) docker_arch=arm64 ;;
+    x86_64|amd64)  docker_arch=amd64 ;;
+    *)             docker_arch="$(uname -m)" ;;
+  esac
+  step "$docker_arch manifests"
   for image in $(printf '%s\n' "$FALKORDB_IMAGE" "$VLLM_IMAGE" "$EMBED_IMAGE" | sort -u); do
     local manifest
     manifest=$(run_bounded 60 docker manifest inspect "$image" 2>&1) || manifest=""
     if [[ -z "$manifest" || "$manifest" == *"manifest unknown"* || "$manifest" == *"no such manifest"* ]]; then
       warn "$image: manifest not found — that tag probably does not exist"
-    elif grep -q '"architecture": *"arm64"' <<<"$manifest"; then
-      ok "$image has an arm64 build"
+    elif grep -q "\"architecture\": *\"$docker_arch\"" <<<"$manifest"; then
+      ok "$image has an $docker_arch build"
     elif ! grep -q '"manifests"' <<<"$manifest"; then
       ok "$image is a single-arch image (assuming it matches this host)"
     else
-      warn "$image has NO arm64 build. It will not run on this host."
+      warn "$image has NO $docker_arch build. It will not run on this host."
       warn "  architectures offered: $(grep -o '"architecture": *"[a-z0-9]*"' <<<"$manifest" \
             | grep -v unknown | sed 's/.*"\([a-z0-9]*\)"$/\1/' | sort -u | tr '\n' ' ')"
     fi
   done
+
+  step "NVFP4 kernels"
+  # Only native on Blackwell. Elsewhere vLLM falls back to Marlin (FP4 weights,
+  # bf16 activations) — fine — or, failing that, to EMULATION, which serves the
+  # same model orders of magnitude slower: every agent request then times out
+  # and the run records nothing. The choice is logged once, at load.
+  # Judge the container that is actually serving, not only the configuration:
+  # after a model switch that never recreated it, the two differ.
+  local live_llm=""
+  if container_exists sosim-llm; then
+    live_llm=$(docker inspect --format '{{join .Args " "}}' sosim-llm 2>/dev/null) || live_llm=""
+    warn_if_llm_flags_stale
+  fi
+  if [[ "$LLM_MODEL_REPO" != *NVFP4* && "$live_llm" != *NVFP4* ]]; then
+    note "$LLM_MODEL_REPO is not an NVFP4 checkpoint; nothing to check"
+  elif ! container_exists sosim-llm; then
+    note "LLM container not created yet; start the stack and re-run doctor"
+  else
+    local moe_backend
+    moe_backend=$(run_bounded 60 docker logs sosim-llm 2>&1 \
+      | grep -m1 -oE "Using '?[A-Za-z0-9_]+'? (NvFp4|NVFP4) MoE backend" || true)
+    if [[ -z "$moe_backend" ]]; then
+      note "no NVFP4 MoE backend line in the LLM log (still loading, or this vLLM does not log it)"
+    elif [[ "$moe_backend" == *EMULATION* ]]; then
+      fail "vLLM is EMULATING NVFP4: '$moe_backend'. Expect every agent request to time out."
+      warn "  On a non-Blackwell GPU it should pick MARLIN. Check the image and the"
+      warn "  vLLM log (docker logs sosim-llm | grep -i fp4), or serve an AWQ build instead."
+    else
+      ok "$moe_backend"
+    fi
+  fi
 
   step "Embedding dimension"
   # EMBEDDING_DIM is a one-way door: the vector index is created with it, so a
@@ -1198,14 +1779,14 @@ do_doctor() {
   # the real question here, where it costs one request.
   local sim_py="$ROOT/backend/.venv/bin/python"
   if [[ ! -x "$sim_py" ]]; then
-    note "backend venv missing at $sim_py — run: $0 setup"
+    note "backend venv missing at $sim_py — run: $SELF setup"
   else
     load_env
     local llm_budget_s="${SIM_MODEL_TIMEOUT:-300}"
     # Give the wrapper a little more than the request itself is allowed, so a
     # bounded-out probe means the request hung, not that we cut it short.
     local probe_budget_s=$(( ${llm_budget_s%.*} + 30 ))
-    if run_bounded "$probe_budget_s" "$sim_py" \
+    if run_bounded "$probe_budget_s" ${APP_ENV[@]+"${APP_ENV[@]}"} "$sim_py" \
          "$ROOT/backend/scripts/run_parallel_simulation.py" \
          --preflight-only --twitter-only; then
       ok "the endpoint returns a tool call over an agent-sized prompt"
@@ -1216,6 +1797,7 @@ do_doctor() {
 
   step "Config sanity"
   load_env
+  warn_missing_env_seed
   [[ -n "${ZEP_BASE_URL:-}" ]] && ok "ZEP_BASE_URL=$ZEP_BASE_URL" \
     || warn "ZEP_BASE_URL unset — SoSim would talk to Zep Cloud."
   [[ -z "${ZEP_API_URL:-}" ]] && ok "ZEP_API_URL unset (required)" \
@@ -1294,7 +1876,7 @@ do_doctor() {
       note "vLLM is EXPECTED to enforce it with constrained decoding, but that is"
       note "UNCONFIRMED here: nothing pins the structured-output backend, and xgrammar"
       note "has historically treated array maxItems as unsupported and ignored it at"
-      note "decode time. To confirm which backend this server chose (not '$0 logs',"
+      note "decode time. To confirm which backend this server chose (not '$SELF logs',"
       note "which follows the stream and would never return):"
       note "  docker logs sosim-llm | grep -iE 'guided|structured.?output|xgrammar|outlines'"
       note "If the runaway-array truncation returns, GRAPHITI_STRUCTURED_OUTPUT_MODE="
@@ -1316,7 +1898,18 @@ do_doctor() {
   esac
 
   [[ -d "$HF_CACHE/hub" ]] && ok "HF cache present at $HF_CACHE" \
-    || warn "no HF cache yet; run '$0 setup' before going offline."
+    || warn "no HF cache yet; run '$SELF setup' before going offline."
+
+  # What a Twitter simulation actually loads, looked up where it will look:
+  # HF_HOME as .env sets it, resolved against the repo root (see load_env), which
+  # need not be where setup downloaded to (HF_CACHE_DIR).
+  if [[ -d "$HF_HOME/hub/models--Twitter--twhin-bert-base" ]]; then
+    ok "Twitter recommender model cached under HF_HOME=$HF_HOME"
+  else
+    warn "Twitter/twhin-bert-base is not under HF_HOME=$HF_HOME, where simulations look."
+    warn "  Twitter and parallel simulations will fail offline (Reddit-only runs are fine)."
+    warn "  Run '$SELF setup', or point HF_HOME in .env at the cache setup filled ($HF_CACHE)."
+  fi
 }
 
 summary() {
@@ -1326,6 +1919,8 @@ summary() {
 $(printf '%s' "$G")SoSim is up.$(printf '%s' "$N")
 
   Open:  http://$ip:$FRONTEND_PORT
+
+  Runtime: $RUNTIME — $RUNTIME_LABEL
 
   Expose ONLY this port on the network:
 
@@ -1340,35 +1935,61 @@ $(printf '%s' "$G")SoSim is up.$(printf '%s' "$N")
 
   To reach the UI by hostname rather than IP, set VITE_ALLOWED_HOSTS in .env.
 
-  $0 status | logs [llm|backend|zep-shim|frontend|embed|falkordb] | stop
+  $SELF status | logs [llm|backend|zep-shim|frontend|embed|falkordb] | stop
 
 EOF
 }
 
 # =============================================================================
 
-usage() { sed -n '3,17p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+# The header comment, from its first line down to (not including) the paragraph
+# about hosted APIs — anchored on text rather than line numbers, so the header
+# can grow without cutting the help short.
+usage() {
+  sed -n '3,/^# Nothing here talks to a hosted API/p' "${BASH_SOURCE[0]}" \
+    | sed '$d' | sed 's/^# \{0,1\}//'
+}
 
 # -v/--verbose anywhere in the arguments echoes every external command.
+# --runtime <name> / --runtime=<name> selects a runtime profile (load_runtime).
 ARGS=()
+expect_runtime=0
 for arg in "$@"; do
+  if (( expect_runtime )); then
+    [[ -n "$arg" ]] || die "--runtime needs a name. Available: $(runtime_names | tr '\n' ' ')"
+    RUNTIME_ARG="$arg"; expect_runtime=0; continue
+  fi
   case "$arg" in
     -v|--verbose) VERBOSE=1 ;;
+    --runtime)    expect_runtime=1 ;;
+    --runtime=*)  RUNTIME_ARG="${arg#--runtime=}"
+                  [[ -n "$RUNTIME_ARG" ]] || die "--runtime needs a name. Available: $(runtime_names | tr '\n' ' ')" ;;
     *) ARGS+=("$arg") ;;
   esac
 done
+(( expect_runtime == 0 )) || die "--runtime needs a name. Available: $(runtime_names | tr '\n' ' ')"
 set -- "${ARGS[@]:-}"
 
 if [[ "$VERBOSE" == 1 ]]; then
   note "verbose mode: every external command is echoed before it runs"
 fi
 
-case "${1:-all}" in
+CMD="${1:-all}"
+case "$CMD" in
+  -h|--help|help) usage; exit 0 ;;
+  runtimes)       list_runtimes; exit 0 ;;
+  setup|start|all|stop|status|logs|test|doctor) ;;
+  *) usage; die "unknown command: $CMD" ;;
+esac
+
+load_runtime "$CMD"
+
+case "$CMD" in
   setup)
     preflight; install_system_deps; install_uv; install_node
     init_submodule; make_env; install_python_deps; install_node_deps
     pull_images; fetch_models
-    step "Setup complete"; note "next: $0 start"
+    step "Setup complete"; note "next: $SELF start"
     ;;
   start)  do_start ;;
   all)
@@ -1381,6 +2002,4 @@ case "${1:-all}" in
   logs)   shift; do_logs "${1:-}" ;;
   test)   do_test ;;
   doctor) do_doctor ;;
-  -h|--help|help) usage ;;
-  *) usage; die "unknown command: $1" ;;
 esac

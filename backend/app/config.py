@@ -18,6 +18,38 @@ else:
     load_dotenv(override=True)
 
 
+def pin_root_relative_paths(root, keys=("HF_HOME",), environ=None):
+    """Rewrite each relative path in `keys` as an absolute path under `root`.
+
+    .env writes HF_HOME=./data/hf-cache relative to the repository root, but this
+    process runs in backend/ and each simulation it starts runs in its own
+    directory - and huggingface_hub resolves a relative HF_HOME against whatever
+    the current directory is. With HF_HUB_OFFLINE=1 that made every Twitter
+    simulation fail to find the recommender model setup had cached. Pinning it
+    here fixes the backend and, through the inherited environment, every
+    simulation it launches.
+
+    Twin of pin_to_root in backend/scripts/env_paths.py, which the simulation
+    scripts use and this package cannot import; test_env_paths.py keeps the two
+    in step.
+    """
+    env = os.environ if environ is None else environ
+    changed = {}
+    for key in keys:
+        value = env.get(key)
+        if not value:
+            continue
+        expanded = os.path.expanduser(os.path.expandvars(value))
+        if os.path.isabs(expanded):
+            continue
+        env[key] = os.path.normpath(os.path.join(os.path.abspath(root), expanded))
+        changed[key] = env[key]
+    return changed
+
+
+pin_root_relative_paths(os.path.dirname(os.path.abspath(project_root_env)))
+
+
 class Config:
     """Flask configuration."""
 

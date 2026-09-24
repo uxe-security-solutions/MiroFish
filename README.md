@@ -48,8 +48,39 @@ nothing leaves the box once setup has finished.
 
 ## Fully local deployment
 
-The reference target is an **NVIDIA DGX Spark** (GB10, aarch64, 128GB unified memory),
-but any Linux box with Docker and a working NVIDIA container runtime will do.
+Everything runs on one machine: a vLLM chat server, a second vLLM serving embeddings,
+FalkorDB, the Zep-compatible shim, the backend and the frontend. What depends on the
+hardware - the vLLM image, the weights, GPU memory, start-up order - lives in a
+**runtime profile** under [`scripts/runtimes/`](scripts/runtimes/), and each profile
+has its own entry script:
+
+| Runtime | Hardware | Entry script |
+|---|---|---|
+| `dgx-spark` | NVIDIA DGX Spark - GB10 (sm_121), aarch64, 128GB unified memory | [`scripts/provision_dgx_spark.sh`](scripts/provision_dgx_spark.sh) |
+| `l40s` | NVIDIA L40S 48GB - Ada (sm_89), x86_64, including the `L40S-48C` vGPU | [`scripts/provision_l40s.sh`](scripts/provision_l40s.sh) |
+
+Both wrap [`scripts/provision_local.sh`](scripts/provision_local.sh), which takes the
+same commands and does the work. The DGX Spark profile is exactly what the script
+shipped with before profiles existed: same image, same weights, same flags, same
+containers - [`scripts/tests/test_runtimes.sh`](scripts/tests/test_runtimes.sh) pins its
+`docker run` lines word for word.
+
+| | `dgx-spark` | `l40s` |
+|---|---|---|
+| vLLM image | NGC `nvcr.io/nvidia/vllm:26.05.post1-py3` | `vllm/vllm-openai:v0.30.0` (compiles sm_89; CUDA 13.0) |
+| LLM weights | `RedHatAI/Qwen3.6-35B-A3B-NVFP4` - native FP4 | the same checkpoint - Marlin kernels (FP4 weights, bf16 activations) |
+| `GPU_MEM_UTIL` / `EMBED_GPU_MEM_UTIL` | 0.70 / 0.08 of a unified pool | 0.80 / 0.08 of a 48GB card |
+| Context / batch | 32768 / 16 sequences | 32768 / 16 sequences |
+| Extra LLM flags | none | `--language-model-only --max-num-batched-tokens 8192` |
+| Server start order | both launched, then both awaited | embeddings healthy first, then the LLM (allowed ~15 min to load) |
+| Page cache dropped before the LLM loads | yes (unified memory) | no (host RAM is not VRAM) |
+| GPU visible to backend / simulations | n/a - aarch64 torch is CPU-only | hidden (`CUDA_VISIBLE_DEVICES=`), so they run on CPU as on the DGX |
+| New `.env` also gets | - | `SIM_MODEL_EXTRA_BODY` with thinking off (see below) |
+| Doctor also checks | sm_121 kernels, arm64 images | sm_89/sm_86 kernels, amd64 images, vGPU license, free VRAM |
+
+Everything above the model server - `.env`, the concurrency keys, the tool-call parser,
+the thinking switch - is shared: the chat template is byte-identical across these
+Qwen3.6-35B-A3B builds.
 
 ### Prerequisites
 
@@ -64,7 +95,8 @@ disk. The provisioning script installs everything else (uv, Node 22, build tools
 ```bash
 git clone --recurse-submodules git@github.com:uxe-security-solutions/MiroFish.git
 cd MiroFish
-./scripts/provision_local.sh all
+./scripts/provision_dgx_spark.sh all    # on a DGX Spark
+./scripts/provision_l40s.sh all         # on an L40S server
 ```
 
 > The product is SoSim; the Git repository is still named `MiroFish`. That is
@@ -72,16 +104,18 @@ cd MiroFish
 > path stays as it is.
 
 If you cloned without `--recurse-submodules`, the script initialises the submodule
-itself. `all` = `setup` then `start`:
+itself. `all` = `setup` then `start`. Every command works with any of the three
+scripts (shown here with the L40S one):
 
 ```bash
-./scripts/provision_local.sh setup    # packages, submodule, .env, images, models - NEEDS NETWORK
-./scripts/provision_local.sh start    # bring the stack up - fully offline
-./scripts/provision_local.sh status   # what is up, and where
-./scripts/provision_local.sh logs llm # or: backend, zep-shim, frontend, embed, falkordb
-./scripts/provision_local.sh doctor   # verify GPU arch, arm64 manifests, config sanity
-./scripts/provision_local.sh test     # run both test suites (no GPU, no network)
-./scripts/provision_local.sh stop
+./scripts/provision_l40s.sh setup     # packages, submodule, .env, images, models - NEEDS NETWORK
+./scripts/provision_l40s.sh start     # bring the stack up - fully offline
+./scripts/provision_l40s.sh status    # what is up, and where
+./scripts/provision_l40s.sh logs llm  # or: backend, zep-shim, frontend, embed, falkordb
+./scripts/provision_l40s.sh doctor    # runtime vs this host, GPU kernels, image arch, config sanity
+./scripts/provision_l40s.sh test      # the test suites (no GPU, no network)
+./scripts/provision_l40s.sh stop
+./scripts/provision_local.sh runtimes # list the profiles and which one this host uses
 ```
 
 Add `-v` (or `VERBOSE=1`) to echo every external command as it runs.
@@ -92,6 +126,105 @@ can be disconnected: `HF_HUB_OFFLINE=1`, `TRANSFORMERS_OFFLINE=1` and
 
 Review `.env` before the first `start` - it is created from `.env.example` and never
 overwritten.
+
+### Which runtime a command uses
+
+Most explicit first:
+
+1. The wrapper you ran (it passes `--runtime <name>`), `provision_local.sh --runtime <name>`,
+   or `SOSIM_RUNTIME=<name>` in the environment.
+2. `SOSIM_RUNTIME` in `.env`. `setup` writes it, so after the first `setup` the bare
+   `./scripts/provision_local.sh start` keeps using the same profile.
+3. With nothing recorded, the one profile whose CPU architecture and GPU compute
+   capability both match this host (a GB10 gives `dgx-spark`, an L40S `l40s`).
+4. Otherwise `dgx-spark` - which is why a DGX Spark set up before profiles existed
+   carries on unchanged with the old command.
+
+`setup`, `start` and `all` refuse, before anything is touched:
+
+- a wrapper that contradicts `SOSIM_RUNTIME` in `.env` - the weights on disk belong to
+  the recorded runtime, and starting the other one would only fail minutes later inside
+  vLLM;
+- a runtime this host positively belongs to another profile for - the other wrapper run
+  by mistake, or an `.env` carried over from the other machine. The message names the
+  right command. `SOSIM_FORCE_RUNTIME=1` overrides it, for a deliberate experiment.
+
+To really move a host, stop the stack, delete the `SOSIM_RUNTIME` line from `.env`, and
+run the new runtime's `setup`. `stop`, `logs` and `test` never query the GPU, so they
+still work with a wedged driver.
+
+Every profile value can be overridden per command from the environment, e.g.
+`GPU_MEM_UTIL=0.78 ./scripts/provision_l40s.sh start`, or for good by adding it to
+`.env`, which `start` reads after the profile. **Sizing only applies when a container is
+created**: `start` leaves a running server alone (and warns when its flags differ from the
+current values), so recreate it to apply a change -
+`docker rm -f sosim-llm && GPU_MEM_UTIL=0.78 ./scripts/provision_l40s.sh start`.
+
+A new runtime is one more file in `scripts/runtimes/` (copy the closest one;
+`load_runtime` in `provision_local.sh` refuses a profile that leaves a required value
+unset) plus a two-line wrapper.
+
+### On the L40S
+
+What the box needs before `setup`: Docker with the NVIDIA Container Toolkit (so
+`docker run --gpus all` works in the VM), the vGPU guest driver left in place (not
+replaced by a distro CUDA package), and ~70GB free disk for the weights (~25GB), bge-m3,
+the recommender model and the vLLM image (~9GB compressed).
+
+- **The vGPU has to be licensed.** An NVIDIA vGPU for Compute guest runs at full speed
+  for 20 minutes after boot and then drops to idle-level compute until it gets a
+  license. Nothing crashes - `/v1/models` still answers - the agents just stop finishing
+  their requests. `doctor`, `setup` and `start` check `nvidia-smi -q` and fail loudly
+  when the license status is not `Licensed`.
+- **Same weights, different kernels.** Ada has no FP4 tensor cores, so vLLM serves the
+  NVFP4 checkpoint through Marlin (weight-only FP4, bf16 activations). That path is
+  supported but far less exercised than native FP4: after the first `start`, run
+  `doctor` - it reports the MoE backend vLLM chose (it should say `MARLIN`; `EMULATION`
+  is a failure) and sends one real agent-shaped tool call. Read a few agent posts from
+  the first short run, too: garbled text is the one failure a tool-call check will not
+  catch. If it misbehaves, serve an AWQ build of the same base instead, pinned to the
+  commit that was checked (its weights have been replaced in place before). `setup`
+  downloads it; the running NVFP4 container has to be removed, or `start` keeps it:
+
+  ```bash
+  export LLM_MODEL_REPO=cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit
+  export LLM_MODEL_REVISION=00fcea2d3bcf5389b518d4fc082e5590e0ba4844
+  ./scripts/provision_l40s.sh setup && docker rm -f sosim-llm && ./scripts/provision_l40s.sh start
+  ```
+
+  The exports last only for that shell. Put both lines in the shell profile of whoever
+  runs these scripts (or in `.env`, which `start` reads - but `setup` does not), or a
+  later recreation - the reboot recovery below, say - quietly goes back to NVFP4.
+
+  Not FP8 or 8-bit builds: at 37-40GB they leave 1-5GB of the card for the KV cache.
+- **One vLLM server at a time.** vLLM sizes its KV cache from the card's free memory
+  while it profiles, and a second server loading at the same moment skews that. `start`
+  therefore waits for the embeddings server before it creates the LLM. After a reboot,
+  Docker restarts both containers at once; if the LLM comes back with a small cache (see
+  `Available KV cache memory` in `docker logs sosim-llm`) or not at all, recreate it:
+  `docker rm -f sosim-llm && ./scripts/provision_l40s.sh start` (with the AWQ variables
+  set, if you switched).
+- **Headroom.** `GPU_MEM_UTIL=0.80` is ~38.4GB for the LLM, ~15GB of it KV cache -
+  enough for all 16 sequences at the full 32K context. The embeddings server (~2-2.5GB),
+  both CUDA contexts, any desktop session in the VM (gnome-shell holds ~0.2GB and grows
+  with use) and whatever part of the framebuffer the vGPU keeps in reserve share the
+  rest. `start` checks the card's free memory before it launches anything. Once the
+  stack is up, `Available KV cache memory` in `docker logs sosim-llm` and
+  `nvidia-smi --query-gpu=memory.free --format=csv` show how much room is really left;
+  raise `GPU_MEM_UTIL` towards 0.85 only from those numbers, and recreate the container to
+  apply it (see "Which runtime a command uses"). Running the VM headless
+  (`sudo systemctl set-default multi-user.target`) keeps the margin intact.
+- **Thinking is switched off in a new `.env`.** This model reasons before it answers
+  unless told not to, and within `SIM_MODEL_MAX_TOKENS=1024` a reasoning agent never
+  reaches its tool call. When `setup` creates `.env` on this runtime it therefore adds
+  `SIM_MODEL_EXTRA_BODY='{"chat_template_kwargs":{"enable_thinking":false}}'`. An
+  existing `.env` gets it only when `setup` first records the runtime in it (a host
+  switching to `l40s`); otherwise `start` and `doctor` warn that it is missing.
+- **The backend's torch has CUDA on x86_64** (~4GB of `nvidia-*` wheels, harmless),
+  and OASIS would put its Twitter recommender on the GPU - with batches of 1000 posts
+  that is an OOM next to vLLM. The script starts the backend and shim with
+  `CUDA_VISIBLE_DEVICES=` so it runs on the CPU, as it does on the DGX. If you run the
+  backend by hand (`npm run dev`) on this host, do the same.
 
 ### Upgrading from a pre-rename checkout
 
@@ -128,9 +261,13 @@ the backend's upload tree, and `.env`.
 > and `rm -rf data/` is how you make it. Delete the named files below, never the
 > directory holding them.
 
+The commands below use `provision_l40s.sh`; on a DGX Spark use `provision_dgx_spark.sh`.
+Use the wrapper rather than the bare `provision_local.sh`: step 4 moves `.env` - and the
+`SOSIM_RUNTIME` recorded in it - out of the way, and the wrapper is what puts it back.
+
 ```bash
 cd /path/to/MiroFish
-./scripts/provision_local.sh stop
+./scripts/provision_l40s.sh stop
 
 # 1. The shim's SQLite state: which episodes of which build already committed.
 #    BOTH paths, because which one is live depends on your .env vintage - the
@@ -155,15 +292,22 @@ rm -rf backend/uploads/projects backend/uploads/simulations backend/uploads/repo
 #    data/ is gitignored, so the backup cannot be committed by accident.
 mv .env data/env.pre-wipe.bak
 
-./scripts/provision_local.sh setup   # recreates .env; weights and images are cached
-./scripts/provision_local.sh start
+./scripts/provision_l40s.sh setup   # recreates .env and records the runtime; weights and images are cached
+
+# 5. Put back anything you had deliberately tuned - BEFORE start, because sizing
+#    only applies when the containers are created (see below).
+diff data/env.pre-wipe.bak .env
+
+./scripts/provision_l40s.sh start
+./scripts/provision_l40s.sh doctor
 ```
 
 `setup` is the right way back up, and it is quick after a wipe, because the weights are
 still in `data/hf-cache/` and the images are still in Docker. Be precise about what it
 does, though: it re-creates `.env` from `.env.example`, and then adds only the keys that
-are *missing* from it — in practice just `ZEP_COMPAT_DB_PATH`, which a fresh copy does
-not pin to an absolute path. It does **not**
+are *missing* from it — in practice `SOSIM_RUNTIME`, `ZEP_COMPAT_DB_PATH` (which a
+fresh copy does not pin to an absolute path) and, on `l40s`, `SIM_MODEL_EXTRA_BODY`
+with thinking off. It does **not**
 re-derive the concurrency keys for this host's `MAX_NUM_SEQS`. `ensure_env_key` only
 writes a key that is *absent*, and the fresh copy already carries `SIM_LLM_SEMAPHORE`,
 `ZEP_COMPAT_BATCH_CONCURRENCY` and `SEMAPHORE_LIMIT` at the values derived for the
@@ -175,7 +319,7 @@ default `MAX_NUM_SEQS=16`, so none of them fires (the script's own comment says 
 `MAX_NUM_SEQS / 2` — then check the result with the same value in the environment:
 
 ```bash
-MAX_NUM_SEQS=32 ./scripts/provision_local.sh doctor
+MAX_NUM_SEQS=32 ./scripts/provision_l40s.sh doctor
 ```
 
 Both `setup` and `doctor` re-check that product against the current `MAX_NUM_SEQS` and
@@ -188,15 +332,20 @@ still useful. If you would rather not see the failures, replace step 4 and `setu
 
 ```bash
 mv .env data/env.pre-wipe.bak && cp .env.example .env
-./scripts/provision_local.sh start
+diff data/env.pre-wipe.bak .env    # put back what you had tuned, before start
+./scripts/provision_l40s.sh start
+./scripts/provision_l40s.sh doctor
 ```
 
-Then put back anything you had deliberately tuned, and re-check the result:
+(`start` does not record the runtime - only `setup` does - so the new `.env` has no
+`SOSIM_RUNTIME` line until you add one. Until then, bare `provision_local.sh` commands
+pick the profile that matches this host's GPU. On `l40s` it also lacks the thinking-off
+line `setup` would have added; `start` warns and prints the line to copy in.)
 
-```bash
-diff data/env.pre-wipe.bak .env
-./scripts/provision_local.sh doctor
-```
+If you only notice a missing value after `start`, putting it into `.env` is not enough:
+the running servers keep what they were created with. Restart the stack so they pick it
+up - `./scripts/provision_l40s.sh stop && ./scripts/provision_l40s.sh start` - and then run
+`doctor`, which warns when the running LLM's sizing differs from `.env`.
 
 Also *not* part of the wipe: `data/logs/` (append-only, and it holds the evidence for
 whatever made you wipe) and `data/run/` (pidfiles, already cleared by `stop`).
@@ -304,17 +453,20 @@ default (bge-m3, 1024) matches Graphiti's default exactly.
 
 ### Model choices
 
-Defaults are set in `scripts/provision_local.sh` and overridable by environment:
+Defaults are set per runtime in `scripts/runtimes/<name>.sh` and overridable by
+environment:
 
-- **LLM** - `RedHatAI/Qwen3.6-35B-A3B-NVFP4`. A Mixture-of-Experts model is the right
-  shape here: GB10 has ~273 GB/s of bandwidth, decode is bandwidth-bound, and MoE reads
-  far fewer weights per token.
-- **Embeddings** - `BAAI/bge-m3` on a second vLLM container in pooling mode.
-  HuggingFace TEI would have been the obvious choice but publishes **no arm64 image at
-  all** - every `cpu-*` tag is amd64-only. Reusing the vLLM image means one fewer
-  dependency and a guaranteed arm64 build. It takes a small slice of GPU memory
-  (`EMBED_GPU_MEM_UTIL`, default `0.08`); `GPU_MEM_UTIL` for the main LLM is
-  correspondingly `0.70`, and the two must sum well under 1.0 because each is a
+- **LLM** - `RedHatAI/Qwen3.6-35B-A3B-NVFP4` on both runtimes. A Mixture-of-Experts
+  model (3B active of 35B) is the right shape here: decode is bandwidth-bound - ~273 GB/s
+  on GB10, ~864 GB/s on the L40S - and MoE reads far fewer weights per token. At ~21GB
+  for the language model it also leaves a 48GB card room for the KV cache, which only 10
+  of its 40 layers need.
+- **Embeddings** - `BAAI/bge-m3` on a second vLLM container in pooling mode, from the
+  same image as the LLM. HuggingFace TEI would have been the obvious choice but
+  publishes **no arm64 image at all** - every `cpu-*` tag is amd64-only - and one image
+  for both servers is one fewer dependency on either runtime. It takes a small slice of
+  GPU memory (`EMBED_GPU_MEM_UTIL`, `0.08` on both); `GPU_MEM_UTIL` for the main LLM is
+  `0.70` on the DGX's unified pool and `0.80` on the L40S's dedicated card. Each is a
   fraction of *total* memory.
 - **Graph DB** - FalkorDB (Redis-based, no JVM). Neo4j works too:
   `GRAPHITI_DB_BACKEND=neo4j`.
@@ -329,30 +481,49 @@ Two different requirements land on that one LLM endpoint, and both matter:
 
 ### Sizing and expectations, honestly
 
-- `GPU_MEM_UTIL` defaults to a conservative `0.70`. It is a fraction of *total* device
-  memory, and on unified memory that competes with the OS, the container runtime and
-  the page cache. `0.90` has been reported getting the engine SIGTERM'd by `earlyoom`,
-  which does **not** look like an OOM in the logs.
-- `MAX_NUM_SEQS` defaults to 16, and SoSim's own OASIS concurrency is 30. Independent
-  reports put practical GB10 concurrency at 5-10 before latency degrades badly, and
-  NVIDIA's own vLLM playbook uses `--max-num-seqs 4`. Sweep 1/4/8/16/32 and measure p95
-  latency before trusting a number.
+- **DGX Spark:** `GPU_MEM_UTIL` defaults to a conservative `0.70`. It is a fraction of
+  *total* device memory, and on unified memory that competes with the OS, the container
+  runtime and the page cache. `0.90` has been reported getting the engine SIGTERM'd by
+  `earlyoom`, which does **not** look like an OOM in the logs.
+- **L40S:** `GPU_MEM_UTIL` is `0.80` of a card nothing else shares, which leaves ~15GB
+  of KV cache and recurrent state - enough for all 16 sequences at the full 32K context.
+  Raise it towards `0.85` only after reading `Available KV cache memory` in
+  `docker logs sosim-llm`; ignore the `GPU KV cache size: N tokens` line, which vLLM
+  misreports for hybrid models like this one.
+- `MAX_NUM_SEQS` defaults to 16 on both, and SoSim's own OASIS concurrency is 30.
+  Independent reports put practical GB10 concurrency at 5-10 before latency degrades
+  badly, and NVIDIA's own vLLM playbook uses `--max-num-seqs 4`. The L40S has ~3x the
+  bandwidth and may take more. Either way, sweep 1/4/8/16/32 and measure p95 latency
+  before trusting a number - recreating `sosim-llm` for each value, and re-deriving the
+  three concurrency keys in `.env` (see the wipe section) for the one you keep.
 - Start with **few agents and few rounds**. Every round is many LLM calls per agent;
   even a paid API gets expensive past 40 rounds.
 - A **Twitter** simulation loads `Twitter/twhin-bert-base` (~1GB) for its recommender;
-  `setup` pre-caches it. **Reddit** needs no model at all, so Reddit-only runs are the
+  `setup` pre-caches it under `data/hf-cache/`. `HF_HOME=./data/hf-cache` in `.env` is
+  resolved against the repo root wherever it is read - the backend and each simulation
+  run in other directories, and until this was fixed they looked for the model there
+  and, offline, every Twitter simulation failed to load it. `doctor` checks the model
+  is where simulations will look. **Reddit** needs no model at all, so Reddit-only runs are the
   lighter path.
-- SoSim's own Python process gets **CPU-only torch** on aarch64 (no CUDA wheels there).
-  That is fine - it only uses torch for the small recommender model. The GPU is for the
-  vLLM server.
+- SoSim's own Python process runs torch on the **CPU** on both runtimes - on aarch64
+  because PyPI has no CUDA wheels, on the L40S because the script hides the GPU from it.
+  That is fine - it only uses torch for the recommender model. The GPU is for the vLLM
+  servers.
 
 ### Testing without a GPU
 
-Both suites run on a laptop, no GPU, no network, no LLM:
+All three suites run on a laptop, no GPU, no network, no LLM:
 
 ```bash
 ./scripts/provision_local.sh test
 ```
+
+The first suite, [`scripts/tests/test_runtimes.sh`](scripts/tests/test_runtimes.sh),
+runs the provisioning script itself against stubbed `docker`, `nvidia-smi` and `curl`,
+for both runtimes. It pins the DGX Spark containers word for word, so a change made for
+another runtime cannot quietly alter them, and it checks the L40S wiring (entrypoint,
+start order, hidden GPU), runtime selection and the doctor checks. It needs no venv and
+runs anywhere with bash 3.2 or later.
 
 The shim's tests are worth knowing about, because they are what makes the drop-in claim
 checkable:
@@ -428,6 +599,7 @@ two hosted services. The LLM was a config change; Zep was not.
 | **English-only** | The Chinese locale, the runtime language switcher and the backend locale layer are gone; the UI and every LLM instruction are compiled-in English. |
 | **Added [`backend/conftest.py`](backend/conftest.py)** | `pytest` worked only via `python -m pytest`; now either form does. |
 | **Added [`scripts/provision_local.sh`](scripts/provision_local.sh)** | One script for the whole stack. |
+| **Added runtime profiles** ([`scripts/runtimes/`](scripts/runtimes/), `provision_dgx_spark.sh`, `provision_l40s.sh`) | The same stack on a DGX Spark and on an L40S 48GB server, with everything hardware-specific in one file per runtime. |
 
 ## Acknowledgments
 
