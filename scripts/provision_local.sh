@@ -1069,7 +1069,18 @@ load_env() {
   set -a
   source "$ROOT/.env"
   set +a
-  export HF_HOME="${HF_HOME:-$HF_CACHE}"
+  # .env writes HF_HOME relative to the repo root (./data/hf-cache), and nothing
+  # started from here runs in the repo root: the backend runs in backend/ and
+  # each simulation in its own directory, where a relative HF_HOME points at
+  # nothing and the offline Twitter recommender cannot be found. The backend and
+  # the simulation scripts pin it themselves too (backend/scripts/env_paths.py);
+  # this covers everything else this script launches.
+  HF_HOME="${HF_HOME:-$HF_CACHE}"
+  case "$HF_HOME" in
+    /*|\~*) ;;
+    *) HF_HOME="$ROOT/${HF_HOME#./}" ;;
+  esac
+  export HF_HOME
   # .env may set runtime values too (it always could override the tunables);
   # re-check them and rebuild what derives from them.
   finalize_runtime
@@ -1888,6 +1899,17 @@ do_doctor() {
 
   [[ -d "$HF_CACHE/hub" ]] && ok "HF cache present at $HF_CACHE" \
     || warn "no HF cache yet; run '$SELF setup' before going offline."
+
+  # What a Twitter simulation actually loads, looked up where it will look:
+  # HF_HOME as .env sets it, resolved against the repo root (see load_env), which
+  # need not be where setup downloaded to (HF_CACHE_DIR).
+  if [[ -d "$HF_HOME/hub/models--Twitter--twhin-bert-base" ]]; then
+    ok "Twitter recommender model cached under HF_HOME=$HF_HOME"
+  else
+    warn "Twitter/twhin-bert-base is not under HF_HOME=$HF_HOME, where simulations look."
+    warn "  Twitter and parallel simulations will fail offline (Reddit-only runs are fine)."
+    warn "  Run '$SELF setup', or point HF_HOME in .env at the cache setup filled ($HF_CACHE)."
+  fi
 }
 
 summary() {

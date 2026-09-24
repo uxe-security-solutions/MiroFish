@@ -137,7 +137,7 @@ run() {
     touch "$box/sb/third_party/graphiti/server/graph_service/zep_compat/router.py"
     local py
     for py in "$box/sb/backend/.venv/bin/python" "$box/sb/third_party/graphiti/server/.venv/bin/python"; do
-      printf '#!/bin/bash\necho "python[cuda=${CUDA_VISIBLE_DEVICES-unset}] $*" >>"$STUB_LOG"\n[[ " $* " == *" --preflight-only "* || "$1 $2" == "-m pytest" ]] && exit 0\nexec /bin/sleep 30\n' >"$py"
+      printf '#!/bin/bash\necho "python[cuda=${CUDA_VISIBLE_DEVICES-unset}][hf=${HF_HOME-unset}] $*" >>"$STUB_LOG"\n[[ " $* " == *" --preflight-only "* || "$1 $2" == "-m pytest" ]] && exit 0\nexec /bin/sleep 30\n' >"$py"
       chmod +x "$py"
     done
   fi
@@ -298,7 +298,12 @@ if [[ "$L40S_VLLM_ENTRYPOINT" == vllm ]]; then
   expect_has "doctor probes torch through python3, not the entrypoint" "$probe" "--entrypoint python3 $L40S_VLLM_IMAGE -c"
 fi
 expect_has "doctor accepts sm_86 kernels on an 8.9 card" "$(cat "$WORK/l40s-doctor/out")" "sm_86 present"
-expect_has "doctor preflight runs with the GPU hidden" "$(cat "$WORK/l40s-doctor/calls")" "python[cuda=] $WORK/l40s-doctor/sb/backend/scripts/run_parallel_simulation.py --preflight-only"
+expect_has "doctor preflight runs with the GPU hidden" "$(cat "$WORK/l40s-doctor/calls")" "python[cuda=]["
+expect_has "doctor preflight gets HF_HOME pinned to the repo root" "$(cat "$WORK/l40s-doctor/calls")" "[hf=$WORK/l40s-doctor/sb/data/hf-cache] $WORK/l40s-doctor/sb/backend/scripts/run_parallel_simulation.py --preflight-only"
+expect_has "doctor warns when the Twitter model is not where simulations look" "$(cat "$WORK/l40s-doctor/out")" "Twitter/twhin-bert-base is not under HF_HOME=$WORK/l40s-doctor/sb/data/hf-cache"
+mkdir -p "$WORK/l40s-doctor/sb/data/hf-cache/hub/models--Twitter--twhin-bert-base"
+SEED_ENV="$WORK/l40s/sb/.env" run l40s-doctor l40s x86_64 scripts/provision_l40s.sh doctor
+expect_has "  ...and confirms it when it is" "$(cat "$WORK/l40s-doctor/out")" "Twitter recommender model cached under HF_HOME="
 expect_has "doctor reports the vGPU license" "$(cat "$WORK/l40s-doctor/out")" "vGPU license: Licensed"
 
 SEED_ENV="$WORK/l40s/sb/.env" EXTRA_ENV="STUB_LICENSE=Unlicensed" \

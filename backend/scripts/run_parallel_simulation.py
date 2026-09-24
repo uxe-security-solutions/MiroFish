@@ -106,6 +106,12 @@ else:
         load_dotenv(_backend_env)
         print(f"Loaded the environment configuration: {_backend_env}")
 
+# .env writes HF_HOME relative to the repository root, and this process runs in
+# a simulation directory. Pin it before anything imports huggingface_hub, or the
+# Twitter recommender model is looked for in the wrong place (env_paths.py).
+from env_paths import pin_to_root
+pin_to_root(_project_root)
+
 
 class MaxTokensWarningFilter(logging.Filter):
     """Drop the camel-ai max_tokens warning.

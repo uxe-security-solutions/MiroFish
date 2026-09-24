@@ -499,7 +499,11 @@ Two different requirements land on that one LLM endpoint, and both matter:
 - Start with **few agents and few rounds**. Every round is many LLM calls per agent;
   even a paid API gets expensive past 40 rounds.
 - A **Twitter** simulation loads `Twitter/twhin-bert-base` (~1GB) for its recommender;
-  `setup` pre-caches it. **Reddit** needs no model at all, so Reddit-only runs are the
+  `setup` pre-caches it under `data/hf-cache/`. `HF_HOME=./data/hf-cache` in `.env` is
+  resolved against the repo root wherever it is read - the backend and each simulation
+  run in other directories, and until this was fixed they looked for the model there
+  and, offline, every Twitter simulation failed to load it. `doctor` checks the model
+  is where simulations will look. **Reddit** needs no model at all, so Reddit-only runs are the
   lighter path.
 - SoSim's own Python process runs torch on the **CPU** on both runtimes - on aarch64
   because PyPI has no CUDA wheels, on the L40S because the script hides the GPU from it.
