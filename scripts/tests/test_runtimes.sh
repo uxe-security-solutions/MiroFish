@@ -155,7 +155,7 @@ run() {
     fi
     local py
     for py in "$box/sb/backend/.venv/bin/python" "$box/sb/third_party/graphiti/server/.venv/bin/python"; do
-      printf '#!/bin/bash\necho "python[cuda=${CUDA_VISIBLE_DEVICES-unset}][hf=${HF_HOME-unset}] $*" >>"$STUB_LOG"\n[[ " $* " == *" --preflight-only "* || "$1 $2" == "-m pytest" ]] && exit 0\nexec /bin/sleep 30\n' >"$py"
+      printf '#!/bin/bash\necho "python[cuda=${CUDA_VISIBLE_DEVICES-unset}][hf=${HF_HOME-unset}] $*" >>"$STUB_LOG"\n[ /dev/stdin -ef /dev/null ] && s=devnull || s=inherited\necho "stdin[$s] $*" >>"$STUB_LOG"\n[[ " $* " == *" --preflight-only "* || "$1 $2" == "-m pytest" ]] && exit 0\nexec /bin/sleep 30\n' >"$py"
       chmod +x "$py"
     done
   fi
@@ -165,6 +165,9 @@ run() {
       STUB_LOG="$box/calls" STUB_STATE="$box/state" STUB_GPU="$gpu" STUB_ARCH="$arch" \
       ${EXTRA_ENV:-} bash "$entry" "$@" ) >"$box/out" 2>&1
   echo $? >"$box/rc"
+  # SETTLE=<seconds>: give the background services time to log their own calls
+  # before they are killed (the stub sleep makes start return at once).
+  [[ -n "${SETTLE:-}" ]] && /bin/sleep "$SETTLE"
   pkill -f "$box/sb/" >/dev/null 2>&1 || true
 }
 
@@ -415,6 +418,13 @@ SEED_ENV="$WORK/l40s/sb/.env" EXTRA_ENV="STUB_CRASHLOOP=sosim-embed STUB_CURL_DO
   run crashloop l40s x86_64 scripts/provision_l40s.sh start
 expect_has "a crash-looping embeddings server is reported as such" "$(cat "$WORK/crashloop/out")" "embeddings container sosim-embed crashed and is restarting"
 expect_lacks "  ...not as a timeout" "$(cat "$WORK/crashloop/out")" "embeddings did not become healthy"
+
+# Background services must not hold the caller's stdin: Vite exits when it ends,
+# which is how a frontend started over SSH died at logout. Started from a pipe
+# here, so an inherited stdin would show.
+echo | SETTLE=1 SEED_ENV="$WORK/l40s/sb/.env" run stdin l40s x86_64 scripts/provision_l40s.sh start
+expect_has "background services get /dev/null as stdin" "$(cat "$WORK/stdin/calls")" "stdin[devnull] -m uvicorn"
+expect_lacks "  ...never the caller's" "$(cat "$WORK/stdin/calls")" "stdin[inherited]"
 
 # Every profile must load and validate on its own.
 for profile in "$REPO"/scripts/runtimes/*.sh; do
