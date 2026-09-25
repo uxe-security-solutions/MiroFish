@@ -1086,10 +1086,69 @@ load_env() {
   finalize_runtime
 }
 
+# hf_cached <repo>: does the HF cache hold a snapshot of <repo>? Both vLLM
+# containers run with HF_HUB_OFFLINE=1, so a missing one is fatal to them.
+hf_cached() {
+  local snaps="$HF_CACHE/hub/models--${1//\//--}/snapshots"
+  [[ -d "$snaps" && -n "$(ls -A "$snaps" 2>/dev/null)" ]]
+}
+
+# venv_has <venv dir> <package>: is <package> installed in that venv? Looked up
+# on disk rather than by importing it, which would cost an interpreter start.
+venv_has() {
+  local d
+  for d in "$1"/lib/python*/site-packages/"$2"; do
+    [[ -e "$d" ]] && return 0
+  done
+  return 1
+}
+
+# `start` on a host where `setup` never finished (or failed partway) used to
+# start every service anyway, and each one then failed on its own: the vLLM
+# containers crash-looped on a model the offline cache did not have, the Python
+# services died on a missing import, and vite was not found — 25 minutes of
+# health-check timeouts to say "run setup". Check what setup produces first,
+# and stop in seconds with the list of what is missing.
+check_setup_complete() {
+  step "Setup artifacts"
+  local missing=()
+  container_up sosim-llm || hf_cached "$LLM_MODEL_REPO" \
+    || missing+=("LLM weights $LLM_MODEL_REPO are not in $HF_CACHE")
+  container_up sosim-embed || hf_cached "$EMBED_MODEL_REPO" \
+    || missing+=("embedding weights $EMBED_MODEL_REPO are not in $HF_CACHE")
+  venv_has "$ROOT/backend/.venv" flask \
+    || missing+=("backend dependencies are not installed (backend/.venv has no flask)")
+  venv_has "$ROOT/third_party/graphiti/server/.venv" uvicorn \
+    || missing+=("shim dependencies are not installed (third_party/graphiti/server/.venv has no uvicorn)")
+  [[ -e "$ROOT/frontend/node_modules/.bin/vite" ]] \
+    || missing+=("frontend dependencies are not installed (frontend/node_modules/.bin/vite)")
+  if (( ${#missing[@]} == 0 )); then
+    ok "models cached, dependencies installed"
+    return 0
+  fi
+  local m
+  for m in "${missing[@]}"; do fail "$m"; done
+  die "setup has not completed on this host; nothing was started. Run: $SELF setup"
+}
+
+# container_restarts <container>: its RestartCount, or nothing if unknown.
+container_restarts() {
+  local n
+  n=$(run_bounded 10 docker inspect -f '{{.RestartCount}}' "$1" 2>/dev/null) || return 0
+  [[ "$n" =~ ^[0-9]+$ ]] && printf '%s' "$n"
+}
+
 # Wait for an HTTP endpoint. On failure the caller gets a dumped log, so a
 # timeout always comes with a reason attached.
+#
+# With a container name, a container that dies while we wait ends the wait at
+# once: under --restart unless-stopped a vLLM that fails on startup is revived
+# forever, stays "running" to `docker ps`, and would otherwise only surface as a
+# 15-minute timeout. A restart since the wait began is that crash loop.
 wait_for_http() {
-  local url="$1" name="$2" tries="${3:-120}" logname="${4:-}"
+  local url="$1" name="$2" tries="${3:-120}" logname="${4:-}" container="${5:-}"
+  local restarts0="" restarts
+  [[ -n "$container" ]] && restarts0=$(container_restarts "$container")
   printf '    waiting for %s (%s, up to %ss) ' "$name" "$url" "$((tries * 2))"
   for _ in $(seq "$tries"); do
     # Quiet while polling: -S would print a connection error on every attempt
@@ -1097,6 +1156,15 @@ wait_for_http() {
     if curl -fsS -o /dev/null --max-time 2 "$url" 2>/dev/null; then
       printf ' %sup%s\n' "$G" "$N"
       return 0
+    fi
+    if [[ -n "$container" ]]; then
+      restarts=$(container_restarts "$container")
+      if [[ -n "$restarts0" && -n "$restarts" ]] && (( restarts > restarts0 )); then
+        printf ' %sCRASHED%s\n' "$R" "$N"
+        fail "$name container $container crashed and is restarting (restart count $restarts0 -> $restarts); see its log below"
+        [[ -n "$logname" ]] && dump_log "$logname" 80
+        return 1
+      fi
     fi
     printf '.'; sleep 2
   done
@@ -1501,6 +1569,7 @@ do_start() {
   check_gpu_memory || true
   failures_at_start=$(( failures_at_start + ${#FAILURES[@]} - hw_before ))
   warn_missing_env_seed
+  check_setup_complete
   start_falkordb        || true
   start_embeddings      || true
   if [[ "$GPU_START_ORDER" == serial ]]; then
@@ -1510,15 +1579,15 @@ do_start() {
     # (or trips vLLM's "Error in memory profiling" check). The embeddings server
     # is small and quick, so it goes first and the LLM measures a settled GPU.
     wait_for_http "http://127.0.0.1:$EMBED_PORT/v1/models" "embeddings" \
-      "$EMBED_WAIT_TRIES" embed || true
+      "$EMBED_WAIT_TRIES" embed sosim-embed || true
     start_llm           || true
   else
     start_llm           || true
     wait_for_http "http://127.0.0.1:$EMBED_PORT/v1/models" "embeddings" \
-      "$EMBED_WAIT_TRIES" embed || true
+      "$EMBED_WAIT_TRIES" embed sosim-embed || true
   fi
   wait_for_http "http://127.0.0.1:$LLM_PORT/v1/models" "LLM" \
-    "$LLM_WAIT_TRIES" llm || true
+    "$LLM_WAIT_TRIES" llm sosim-llm || true
 
   start_shim || true
   wait_for_http "http://127.0.0.1:$SHIM_PORT/healthcheck" "shim" \
