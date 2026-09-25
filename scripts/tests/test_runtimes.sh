@@ -65,13 +65,19 @@ case "$1" in
   stop) [[ -f "$S/$2" ]] && echo down >"$S/$2" ;;
   run) prev=""; for a in "$@"; do [[ "$prev" == --name ]] && echo up >"$S/$a"; prev="$a"; done
        [[ "$*" == *get_arch_list* ]] && echo "${STUB_ARCHES:-sm_80_sm_90}" | sed "s/_sm/ sm/g" ;;
-  inspect) [[ "$*" == *.Args* && -n "${STUB_INSPECT_ARGS:-}" ]] && cat "$STUB_INSPECT_ARGS" ;;
+  inspect) [[ "$*" == *.Args* && -n "${STUB_INSPECT_ARGS:-}" ]] && cat "$STUB_INSPECT_ARGS"
+           # STUB_CRASHLOOP=<container>: its restart count goes up on every look.
+           if [[ "$*" == *.RestartCount* && -n "${STUB_CRASHLOOP:-}" && "$*" == *" $STUB_CRASHLOOP"* ]]; then
+             n=$(cat "$S/restarts" 2>/dev/null || echo 0); echo "$n"; echo $((n + 1)) >"$S/restarts"
+           fi ;;
   volume) exit 1 ;;
   manifest) echo "{\"manifests\":[{\"platform\":{\"architecture\": \"arm64\"}},{\"platform\":{\"architecture\": \"amd64\"}}]}" ;;
 esac
 exit 0'
 stub curl '
 echo "curl $*" >>"$STUB_LOG"
+# STUB_CURL_DOWN=<pattern>: URLs matching it refuse connections.
+[[ -n "${STUB_CURL_DOWN:-}" && "$*" == *"$STUB_CURL_DOWN"* ]] && exit 7
 [[ "$*" == */v1/embeddings* ]] && printf "{\"data\":[{\"embedding\":[0.1]}]}"
 exit 0'
 stub nvidia-smi '
@@ -135,6 +141,18 @@ run() {
     mkdir -p "$box/sb/backend/.venv/bin" "$box/sb/third_party/graphiti/server/.venv/bin" \
              "$box/sb/third_party/graphiti/server/graph_service/zep_compat" "$box/sb/frontend/node_modules"
     touch "$box/sb/third_party/graphiti/server/graph_service/zep_compat/router.py"
+    # What a finished `setup` leaves behind, which `start` checks for. NO_SETUP=1
+    # leaves it out.
+    if [[ -z "${NO_SETUP:-}" ]]; then
+      mkdir -p "$box/sb/backend/.venv/lib/python3.12/site-packages/flask" \
+               "$box/sb/third_party/graphiti/server/.venv/lib/python3.12/site-packages/uvicorn" \
+               "$box/sb/frontend/node_modules/.bin"
+      touch "$box/sb/frontend/node_modules/.bin/vite"
+      local repo
+      for repo in RedHatAI/Qwen3.6-35B-A3B-NVFP4 BAAI/bge-m3 cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit; do
+        mkdir -p "$box/sb/data/hf-cache/hub/models--${repo//\//--}/snapshots/0000"
+      done
+    fi
     local py
     for py in "$box/sb/backend/.venv/bin/python" "$box/sb/third_party/graphiti/server/.venv/bin/python"; do
       printf '#!/bin/bash\necho "python[cuda=${CUDA_VISIBLE_DEVICES-unset}][hf=${HF_HOME-unset}] $*" >>"$STUB_LOG"\n[[ " $* " == *" --preflight-only "* || "$1 $2" == "-m pytest" ]] && exit 0\nexec /bin/sleep 30\n' >"$py"
@@ -382,6 +400,21 @@ rm -f "$WORK/l40s/state/containers/sosim-llm"
 EXTRA_ENV="STUB_FREE=38000" run l40s l40s x86_64 scripts/provision_l40s.sh start
 expect_has "recreating the LLM alone is still memory-checked" "$(cat "$WORK/l40s/out")" "vLLM will refuse to start"
 expect_lacks "  ...for the LLM's share only" "$(cat "$WORK/l40s/out")" "and the embeddings server need"
+
+# start on a host where setup never ran stops before starting anything.
+NO_SETUP=1 SEED_ENV="$WORK/l40s/sb/.env" run nosetup l40s x86_64 scripts/provision_l40s.sh start
+expect_eq "start without setup exits 1" 1 "$(cat "$WORK/nosetup/rc")"
+expect_has "  ...naming the missing weights" "$(cat "$WORK/nosetup/out")" "LLM weights RedHatAI/Qwen3.6-35B-A3B-NVFP4 are not in"
+expect_has "  ...and the missing backend deps" "$(cat "$WORK/nosetup/out")" "backend dependencies are not installed"
+expect_has "  ...and the missing frontend deps" "$(cat "$WORK/nosetup/out")" "frontend dependencies are not installed"
+expect_has "  ...and says to run setup" "$(cat "$WORK/nosetup/out")" "Run: scripts/provision_l40s.sh setup"
+expect_lacks "  ...without starting a container" "$(cat "$WORK/nosetup/calls")" "docker run -d"
+
+# A vLLM that crash-loops ends its wait at once instead of timing out.
+SEED_ENV="$WORK/l40s/sb/.env" EXTRA_ENV="STUB_CRASHLOOP=sosim-embed STUB_CURL_DOWN=:8081/" \
+  run crashloop l40s x86_64 scripts/provision_l40s.sh start
+expect_has "a crash-looping embeddings server is reported as such" "$(cat "$WORK/crashloop/out")" "embeddings container sosim-embed crashed and is restarting"
+expect_lacks "  ...not as a timeout" "$(cat "$WORK/crashloop/out")" "embeddings did not become healthy"
 
 # Every profile must load and validate on its own.
 for profile in "$REPO"/scripts/runtimes/*.sh; do
