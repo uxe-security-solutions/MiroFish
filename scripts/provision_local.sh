@@ -1441,11 +1441,18 @@ start_bg() {
   # whole tree (see the killpg note above). Not every host ships it (macOS does
   # not), so branch rather than expanding a possibly-empty array — that trips
   # `set -u` on bash 3.2.
+  #
+  # stdin is /dev/null, never the caller's terminal. Vite (6+) shuts its server
+  # down when stdin ends unless CI=true, and with a TTY it reads that stdin for
+  # its keyboard shortcuts — so a frontend started from an SSH session came up
+  # healthy and then died, without a word in its log, the moment that session
+  # logged out. /dev/null is not a TTY, so Vite never reads it and never sees
+  # it end. The Python services do not read stdin; it changes nothing for them.
   if have setsid; then
-    ( cd "$cwd" && exec setsid "$@" ) >>"$LOG_DIR/$name.log" 2>&1 &
+    ( cd "$cwd" && exec setsid "$@" ) </dev/null >>"$LOG_DIR/$name.log" 2>&1 &
   else
     warn "setsid not found; $name will not get its own process group"
-    ( cd "$cwd" && exec "$@" ) >>"$LOG_DIR/$name.log" 2>&1 &
+    ( cd "$cwd" && exec "$@" ) </dev/null >>"$LOG_DIR/$name.log" 2>&1 &
   fi
   local pid=$!
   echo "$pid" >"$pf"
